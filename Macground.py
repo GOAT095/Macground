@@ -35,6 +35,9 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         super.init()
     }
 
+    var isScreenLocked = false
+    var isDisplayAsleep = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupWindows()
         NotificationCenter.default.addObserver(
@@ -47,6 +50,24 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
             self,
             selector: #selector(sessionDidWake),
             name: NSWorkspace.screensDidWakeNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(sessionDidSleep),
+            name: NSWorkspace.screensDidSleepNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(spaceDidChange),
+            name: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowOcclusionDidChange),
+            name: NSWindow.didChangeOcclusionStateNotification,
             object: nil
         )
         DistributedNotificationCenter.default().addObserver(
@@ -63,7 +84,15 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
-    @objc func sessionDidWake() {
+    func pauseAllPlayers() {
+        for player in players {
+            if player.rate != 0 {
+                player.pause()
+            }
+        }
+    }
+
+    func resumeAllPlayers() {
         for player in players {
             if player.rate == 0 {
                 player.play()
@@ -71,12 +100,46 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func evaluatePlaybackState() {
+        if isScreenLocked || isDisplayAsleep {
+            pauseAllPlayers()
+            return
+        }
+        // Auto-pause when desktop windows are fully covered by fullscreen/maximized apps
+        let isAnyVisible = windows.isEmpty ? true : windows.contains { w in w.occlusionState.contains(.visible) }
+        if isAnyVisible {
+            resumeAllPlayers()
+        } else {
+            pauseAllPlayers()
+        }
+    }
+
+    @objc func windowOcclusionDidChange() {
+        evaluatePlaybackState()
+    }
+
+    @objc func spaceDidChange() {
+        evaluatePlaybackState()
+    }
+
+    @objc func sessionDidSleep() {
+        isDisplayAsleep = true
+        pauseAllPlayers()
+    }
+
+    @objc func sessionDidWake() {
+        isDisplayAsleep = false
+        evaluatePlaybackState()
+    }
+
     @objc func sessionDidLock() {
-        // When screen locks, do not kill extensions mid-lock; let the freshly-reset extension play from 0:00!
+        isScreenLocked = true
+        pauseAllPlayers()
     }
 
     @objc func sessionDidUnlock() {
-        sessionDidWake()
+        isScreenLocked = false
+        evaluatePlaybackState()
         // 1. Kill user-owned Wallpaper extensions immediately in the user's Aqua session
         //    so macOS respawns them fresh at playhead 0:00 before the NEXT screen lock!
         for procName in ["WallpaperAerialsExtension", "WallpaperVideoExtension", "WallpaperAgent", "NeptuneOneWallpaper"] {
@@ -385,7 +448,7 @@ func convertVideoTo4KMOV(videoURL: URL, outputURL: URL) -> Bool {
 
     var currentTime = CMTime.zero
     var totalWritten = 0
-    var lastCGImage: CGImage?
+    var lastBuffer: CVPixelBuffer?
     let colorSpace = CGColorSpaceCreateDeviceRGB()
 
     for _ in 0..<repeatCount {
@@ -414,33 +477,40 @@ func convertVideoTo4KMOV(videoURL: URL, outputURL: URL) -> Bool {
 
             autoreleasepool {
                 guard let pb = CMSampleBufferGetImageBuffer(sb) else { return }
-                CVPixelBufferLockBaseAddress(pb, .readOnly)
-                let cgImg: CGImage? = {
-                    guard let ctx = CGContext(
-                        data: CVPixelBufferGetBaseAddress(pb),
-                        width: targetW,
-                        height: targetH,
-                        bitsPerComponent: 8,
-                        bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
-                        space: colorSpace,
-                        bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
-                    ) else { return nil }
-                    return ctx.makeImage()
-                }()
-                CVPixelBufferUnlockBaseAddress(pb, .readOnly)
-
-                guard let validImg = cgImg else { return }
-                lastCGImage = validImg
+                lastBuffer = pb
+                CVBufferRemoveAllAttachments(pb)
 
                 for _ in 0..<dupPerFrame {
                     if totalWritten >= maxTotalFrames { break }
                     while !writerInput.isReadyForMoreMediaData {
-                        Thread.sleep(forTimeInterval: 0.002)
+                        Thread.sleep(forTimeInterval: 0.001)
                     }
-                    if let buffer = makePixelBuffer(from: validImg, pool: adaptor.pixelBufferPool, width: targetW, height: targetH) {
-                        adaptor.append(buffer, withPresentationTime: currentTime)
+                    if adaptor.append(pb, withPresentationTime: currentTime) {
                         currentTime = CMTimeAdd(currentTime, step)
                         totalWritten += 1
+                    } else {
+                        // Direct buffer append fallback via makePixelBuffer if adaptor rejected raw buffer
+                        CVPixelBufferLockBaseAddress(pb, .readOnly)
+                        let fallbackImg: CGImage? = {
+                            guard let ctx = CGContext(
+                                data: CVPixelBufferGetBaseAddress(pb),
+                                width: targetW,
+                                height: targetH,
+                                bitsPerComponent: 8,
+                                bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+                                space: colorSpace,
+                                bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
+                            ) else { return nil }
+                            return ctx.makeImage()
+                        }()
+                        CVPixelBufferUnlockBaseAddress(pb, .readOnly)
+
+                        if let validImg = fallbackImg,
+                           let cleanBuf = makePixelBuffer(from: validImg, pool: adaptor.pixelBufferPool, width: targetW, height: targetH) {
+                            adaptor.append(cleanBuf, withPresentationTime: currentTime)
+                            currentTime = CMTimeAdd(currentTime, step)
+                            totalWritten += 1
+                        }
                     }
                 }
             }
@@ -457,13 +527,11 @@ func convertVideoTo4KMOV(videoURL: URL, outputURL: URL) -> Bool {
         return false
     }
 
-    if let finalImg = lastCGImage {
+    if let finalBuf = lastBuffer {
         while !writerInput.isReadyForMoreMediaData {
-            Thread.sleep(forTimeInterval: 0.005)
+            Thread.sleep(forTimeInterval: 0.002)
         }
-        if let buffer = makePixelBuffer(from: finalImg, pool: adaptor.pixelBufferPool, width: targetW, height: targetH) {
-            adaptor.append(buffer, withPresentationTime: currentTime)
-        }
+        adaptor.append(finalBuf, withPresentationTime: currentTime)
     }
 
     writerInput.markAsFinished()
@@ -703,7 +771,7 @@ def prepare_lockscreen_mov(media_path: Path) -> Path:
 
     stat = media_path.stat()
     fingerprint = hashlib.sha256(
-        f"{media_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:via_4k_60fps_v7".encode("utf-8")
+        f"{media_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:via_4k_60fps_v8_directgpu".encode("utf-8")
     ).hexdigest()[:12]
     converted_mov = CACHE_DIR / f"{media_path.stem}_{fingerprint}.mov"
 
