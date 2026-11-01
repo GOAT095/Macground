@@ -17,6 +17,7 @@ from pathlib import Path
 SWIFT_DESKTOP_PLAYER_SOURCE = r"""
 import Cocoa
 import AVFoundation
+import UniformTypeIdentifiers
 
 class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
     var windows: [NSWindow] = []
@@ -27,23 +28,68 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
     var playPauseMenuItem: NSMenuItem?
     var muteMenuItem: NSMenuItem?
     var userManuallyPaused = false
-    let mediaURL: URL
+    var mediaURL: URL
     var isMuted: Bool
     let fillScreen: Bool
-    let isGIF: Bool
-
-    init(mediaURL: URL, isMuted: Bool, fillScreen: Bool) {
-        self.mediaURL = mediaURL
-        self.isMuted = isMuted
-        self.fillScreen = fillScreen
-        self.isGIF = mediaURL.pathExtension.lowercased() == "gif"
-        super.init()
-    }
+    var isGIF: Bool
+    var currentSpeed: Float
 
     var isScreenLocked = false
     var isDisplayAsleep = false
 
+    var recentsURL: URL {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return home.appendingPathComponent(".macground_recents.json")
+    }
+
+    init(mediaURL: URL, isMuted: Bool, fillScreen: Bool, speed: Float) {
+        self.mediaURL = mediaURL
+        self.isMuted = isMuted
+        self.fillScreen = fillScreen
+        self.currentSpeed = max(0.1, min(4.0, speed))
+        self.isGIF = mediaURL.pathExtension.lowercased() == "gif"
+        super.init()
+    }
+
+    func loadRecents() -> [String] {
+        guard let data = try? Data(contentsOf: recentsURL),
+              let list = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return list.filter { p in FileManager.default.fileExists(atPath: p) }
+    }
+
+    func saveRecent(path: String) {
+        var list = loadRecents().filter { p in p != path }
+        list.insert(path, at: 0)
+        if list.count > 6 {
+            list = Array(list.prefix(6))
+        }
+        if let data = try? JSONEncoder().encode(list) {
+            try? data.write(to: recentsURL)
+        }
+    }
+
+    func updateLaunchAgentIfPresent() {
+        let plistURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/com.macground.desktop.plist")
+        guard FileManager.default.fileExists(atPath: plistURL.path) else { return }
+        guard let data = try? Data(contentsOf: plistURL),
+              var plist = (try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)) as? [String: Any] else {
+            return
+        }
+        var newArgs: [String] = [CommandLine.arguments[0], mediaURL.path]
+        if !isMuted { newArgs.append("--unmute") }
+        if !fillScreen { newArgs.append("--fit") }
+        if currentSpeed != 1.0 { newArgs.append(contentsOf: ["--speed", String(format: "%.2f", currentSpeed)]) }
+        plist["ProgramArguments"] = newArgs
+        if let updatedData = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
+            try? updatedData.write(to: plistURL)
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        saveRecent(path: mediaURL.path)
         setupWindows()
         setupStatusBarItem()
         NotificationCenter.default.addObserver(
@@ -91,20 +137,87 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func setupStatusBarItem() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if statusItem == nil {
+            statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        }
         if let button = statusItem?.button {
             button.title = "🎬"
             button.toolTip = "Macground: \(mediaURL.lastPathComponent)"
         }
         let menu = NSMenu()
+        menu.autoenablesItems = false
+
         let titleItem = NSMenuItem(title: "🎬 Macground: \(mediaURL.lastPathComponent)", action: nil, keyEquivalent: "")
         titleItem.isEnabled = false
         menu.addItem(titleItem)
         menu.addItem(NSMenuItem.separator())
 
-        playPauseMenuItem = NSMenuItem(title: "Pause Wallpaper", action: #selector(togglePlayPause), keyEquivalent: "p")
+        let changeItem = NSMenuItem(title: "Change Wallpaper...", action: #selector(openWallpaperFilePicker), keyEquivalent: "o")
+        changeItem.target = self
+        menu.addItem(changeItem)
+
+        let recentsMenu = NSMenu()
+        let recents = loadRecents()
+        if recents.isEmpty {
+            let emptyItem = NSMenuItem(title: "No Recent Wallpapers", action: nil, keyEquivalent: "")
+            emptyItem.isEnabled = false
+            recentsMenu.addItem(emptyItem)
+        } else {
+            for path in recents {
+                let u = URL(fileURLWithPath: path)
+                let item = NSMenuItem(title: u.lastPathComponent, action: #selector(selectRecentWallpaper(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = path
+                item.toolTip = path
+                if path == mediaURL.path {
+                    item.state = .on
+                }
+                recentsMenu.addItem(item)
+            }
+            recentsMenu.addItem(NSMenuItem.separator())
+            let clearItem = NSMenuItem(title: "Clear Recents", action: #selector(clearRecents), keyEquivalent: "")
+            clearItem.target = self
+            recentsMenu.addItem(clearItem)
+        }
+        let recentsParentItem = NSMenuItem(title: "Recent Wallpapers", action: nil, keyEquivalent: "")
+        recentsParentItem.submenu = recentsMenu
+        menu.addItem(recentsParentItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        playPauseMenuItem = NSMenuItem(
+            title: userManuallyPaused ? "Resume Wallpaper" : "Pause Wallpaper",
+            action: #selector(togglePlayPause),
+            keyEquivalent: "p"
+        )
         playPauseMenuItem?.target = self
         menu.addItem(playPauseMenuItem!)
+
+        let speedMenu = NSMenu()
+        let speedOptions: [(String, Float)] = [
+            ("0.25x (Super Slow)", 0.25),
+            ("0.5x (Slow-Mo)", 0.5),
+            ("0.75x (Cinematic)", 0.75),
+            ("1.0x (Normal)", 1.0),
+            ("1.25x (Fast)", 1.25),
+            ("1.5x (Very Fast)", 1.5),
+            ("2.0x (Double Speed)", 2.0)
+        ]
+        for (label, s) in speedOptions {
+            let item = NSMenuItem(title: label, action: #selector(selectSpeed(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = NSNumber(value: s)
+            if abs(currentSpeed - s) < 0.05 {
+                item.state = .on
+            }
+            speedMenu.addItem(item)
+        }
+        let speedParentItem = NSMenuItem(title: "Playback Speed (\(String(format: "%.2fx", currentSpeed)))", action: nil, keyEquivalent: "")
+        speedParentItem.submenu = speedMenu
+        if isGIF {
+            speedParentItem.isEnabled = false
+        }
+        menu.addItem(speedParentItem)
 
         if !isGIF {
             muteMenuItem = NSMenuItem(title: isMuted ? "Unmute Audio" : "Mute Audio", action: #selector(toggleMute), keyEquivalent: "m")
@@ -118,6 +231,67 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quitItem)
 
         statusItem?.menu = menu
+    }
+
+    @objc func openWallpaperFilePicker() {
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.movie, .quickTimeMovie, .mpeg4Movie, .gif]
+        panel.title = "Choose Desktop Wallpaper"
+        panel.prompt = "Set Wallpaper"
+        if panel.runModal() == .OK, let selectedURL = panel.url {
+            switchMedia(url: selectedURL)
+        }
+    }
+
+    @objc func selectRecentWallpaper(_ sender: NSMenuItem) {
+        guard let path = sender.representedObject as? String else { return }
+        let selectedURL = URL(fileURLWithPath: path)
+        switchMedia(url: selectedURL)
+    }
+
+    @objc func clearRecents() {
+        try? FileManager.default.removeItem(at: recentsURL)
+        setupStatusBarItem()
+    }
+
+    func switchMedia(url: URL) {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        self.mediaURL = url
+        self.isGIF = url.pathExtension.lowercased() == "gif"
+        saveRecent(path: url.path)
+        updateLaunchAgentIfPresent()
+
+        for player in players {
+            player.pause()
+        }
+        players.removeAll()
+        loopers.removeAll()
+        imageViews.removeAll()
+
+        for window in windows {
+            setupWindowContent(window: window)
+        }
+
+        evaluatePlaybackState()
+        setupStatusBarItem()
+    }
+
+    @objc func selectSpeed(_ sender: NSMenuItem) {
+        guard let speedNum = sender.representedObject as? NSNumber else { return }
+        let newSpeed = speedNum.floatValue
+        currentSpeed = newSpeed
+        for player in players {
+            player.defaultRate = currentSpeed
+            if player.rate > 0 {
+                player.playImmediately(atRate: currentSpeed)
+            }
+        }
+        updateLaunchAgentIfPresent()
+        setupStatusBarItem()
     }
 
     @objc func togglePlayPause() {
@@ -139,6 +313,7 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
             player.isMuted = isMuted
         }
         muteMenuItem?.title = isMuted ? "Unmute Audio" : "Mute Audio"
+        updateLaunchAgentIfPresent()
     }
 
     @objc func quitApp() {
@@ -159,7 +334,8 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
     func resumeAllPlayers() {
         for player in players {
             if player.rate == 0 {
-                player.play()
+                player.defaultRate = currentSpeed
+                player.playImmediately(atRate: currentSpeed)
             }
         }
         for iv in imageViews {
@@ -172,7 +348,6 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
             pauseAllPlayers()
             return
         }
-        // Auto-pause when desktop windows are fully covered by fullscreen/maximized apps
         let isAnyVisible = windows.isEmpty ? true : windows.contains { w in w.occlusionState.contains(.visible) }
         if isAnyVisible {
             resumeAllPlayers()
@@ -209,8 +384,6 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
     @objc func sessionDidUnlock() {
         isScreenLocked = false
         evaluatePlaybackState()
-        // 1. Kill user-owned Wallpaper extensions immediately in the user's Aqua session
-        //    so macOS respawns them fresh at playhead 0:00 before the NEXT screen lock!
         for procName in ["WallpaperAerialsExtension", "WallpaperVideoExtension", "WallpaperAgent", "NeptuneOneWallpaper"] {
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
@@ -219,7 +392,6 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
             task.standardError = FileHandle.nullDevice
             try? task.run()
         }
-        // 2. Touch /tmp/.macground_unlock_trigger so the root WatchPaths LaunchDaemon also resets idleassetsd as root!
         let triggerPath = "/tmp/.macground_unlock_trigger"
         try? "\(Date().timeIntervalSince1970)".write(toFile: triggerPath, atomically: true, encoding: .utf8)
     }
@@ -261,81 +433,94 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
             window.hasShadow = false
             window.backgroundColor = .black
 
-            if isGIF, let gifImage = NSImage(contentsOf: mediaURL) {
-                let containerView = NSView(frame: NSRect(origin: .zero, size: frame.size))
-                containerView.wantsLayer = true
-                containerView.layer?.masksToBounds = true
+            setupWindowContent(window: window)
+            windows.append(window)
+        }
+    }
 
-                let imageView = NSImageView(frame: containerView.bounds)
-                imageView.image = gifImage
-                imageView.animates = true
-                imageView.canDrawSubviewsIntoLayer = true
+    func setupWindowContent(window: NSWindow) {
+        let frame = window.frame
+        if isGIF, let gifImage = NSImage(contentsOf: mediaURL) {
+            let containerView = NSView(frame: NSRect(origin: .zero, size: frame.size))
+            containerView.wantsLayer = true
+            containerView.layer?.masksToBounds = true
 
-                if fillScreen && gifImage.size.width > 0 && gifImage.size.height > 0 {
-                    let screenRatio = frame.width / frame.height
-                    let imageRatio = gifImage.size.width / gifImage.size.height
-                    var drawWidth = frame.width
-                    var drawHeight = frame.height
-                    if screenRatio > imageRatio {
-                        drawHeight = frame.width / imageRatio
-                    } else {
-                        drawWidth = frame.height * imageRatio
-                    }
-                    let offsetX = (frame.width - drawWidth) / 2.0
-                    let offsetY = (frame.height - drawHeight) / 2.0
-                    imageView.frame = NSRect(x: offsetX, y: offsetY, width: drawWidth, height: drawHeight)
-                    imageView.imageScaling = .scaleAxesIndependently
+            let imageView = NSImageView(frame: containerView.bounds)
+            imageView.image = gifImage
+            imageView.animates = true
+            imageView.canDrawSubviewsIntoLayer = true
+
+            if fillScreen && gifImage.size.width > 0 && gifImage.size.height > 0 {
+                let screenRatio = frame.width / frame.height
+                let imageRatio = gifImage.size.width / gifImage.size.height
+                var drawWidth = frame.width
+                var drawHeight = frame.height
+                if screenRatio > imageRatio {
+                    drawHeight = frame.width / imageRatio
                 } else {
-                    imageView.frame = containerView.bounds
-                    imageView.autoresizingMask = [.width, .height]
-                    imageView.imageScaling = .scaleProportionallyUpOrDown
+                    drawWidth = frame.height * imageRatio
                 }
-
-                imageViews.append(imageView)
-                containerView.addSubview(imageView)
-                window.contentView = containerView
-                window.orderFrontRegardless()
-                windows.append(window)
+                let offsetX = (frame.width - drawWidth) / 2.0
+                let offsetY = (frame.height - drawHeight) / 2.0
+                imageView.frame = NSRect(x: offsetX, y: offsetY, width: drawWidth, height: drawHeight)
+                imageView.imageScaling = .scaleAxesIndependently
             } else {
-                let asset = AVURLAsset(url: mediaURL)
-                let view = NSView(frame: NSRect(origin: .zero, size: frame.size))
-                view.wantsLayer = true
-
-                let playerItem = AVPlayerItem(asset: asset)
-                let queuePlayer = AVQueuePlayer(playerItem: playerItem)
-                queuePlayer.isMuted = isMuted
-                queuePlayer.preventsDisplaySleepDuringVideoPlayback = false
-
-                let looper = AVPlayerLooper(player: queuePlayer, templateItem: playerItem)
-
-                let playerLayer = AVPlayerLayer(player: queuePlayer)
-                playerLayer.frame = view.bounds
-                playerLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-                playerLayer.videoGravity = fillScreen ? .resizeAspectFill : .resizeAspect
-
-                view.layer?.addSublayer(playerLayer)
-                window.contentView = view
-                window.orderFrontRegardless()
-
-                queuePlayer.play()
-
-                windows.append(window)
-                players.append(queuePlayer)
-                loopers.append(looper)
+                imageView.frame = containerView.bounds
+                imageView.autoresizingMask = [.width, .height]
+                imageView.imageScaling = .scaleProportionallyUpOrDown
             }
+
+            imageViews.append(imageView)
+            containerView.addSubview(imageView)
+            window.contentView = containerView
+            window.orderFrontRegardless()
+        } else {
+            let asset = AVURLAsset(url: mediaURL)
+            let view = NSView(frame: NSRect(origin: .zero, size: frame.size))
+            view.wantsLayer = true
+
+            let playerItem = AVPlayerItem(asset: asset)
+            let queuePlayer = AVQueuePlayer(playerItem: playerItem)
+            queuePlayer.isMuted = isMuted
+            queuePlayer.defaultRate = currentSpeed
+            queuePlayer.preventsDisplaySleepDuringVideoPlayback = false
+
+            let looper = AVPlayerLooper(player: queuePlayer, templateItem: playerItem)
+
+            let playerLayer = AVPlayerLayer(player: queuePlayer)
+            playerLayer.frame = view.bounds
+            playerLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+            playerLayer.videoGravity = fillScreen ? .resizeAspectFill : .resizeAspect
+
+            view.layer?.addSublayer(playerLayer)
+            window.contentView = view
+            window.orderFrontRegardless()
+
+            if !userManuallyPaused && !isScreenLocked && !isDisplayAsleep {
+                queuePlayer.playImmediately(atRate: currentSpeed)
+            }
+
+            players.append(queuePlayer)
+            loopers.append(looper)
         }
     }
 }
 
 let args = CommandLine.arguments
 guard args.count >= 2 else {
-    fputs("Usage: desktop_video_player <media_path> [--unmute] [--fit]\n", stderr)
+    fputs("Usage: desktop_video_player <media_path> [--unmute] [--fit] [--speed <float>]\n", stderr)
     exit(1)
 }
 
 let mediaPath = args[1]
 let isMuted = !args.contains("--unmute")
 let fillScreen = !args.contains("--fit")
+var speed: Float = 1.0
+if let speedIdx = args.firstIndex(of: "--speed"), speedIdx + 1 < args.count {
+    if let s = Float(args[speedIdx + 1]), s > 0 {
+        speed = s
+    }
+}
 
 let url = URL(fileURLWithPath: mediaPath)
 guard FileManager.default.fileExists(atPath: url.path) else {
@@ -345,7 +530,7 @@ guard FileManager.default.fileExists(atPath: url.path) else {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-let delegate = WallpaperAppDelegate(mediaURL: url, isMuted: isMuted, fillScreen: fillScreen)
+let delegate = WallpaperAppDelegate(mediaURL: url, isMuted: isMuted, fillScreen: fillScreen, speed: speed)
 app.delegate = delegate
 app.run()
 """
@@ -774,7 +959,7 @@ def ensure_compiled_binary() -> Path:
     return compile_swift_helper(
         "desktop_video_player",
         SWIFT_DESKTOP_PLAYER_SOURCE,
-        ["Cocoa", "AVFoundation"],
+        ["Cocoa", "AVFoundation", "UniformTypeIdentifiers"],
     )
 
 
@@ -882,7 +1067,7 @@ def stop_existing_desktop_player():
     subprocess.run(["pkill", "-f", "desktop_video_player"], stderr=subprocess.DEVNULL)
 
 
-def run_desktop_mode(video_path: Path, unmute: bool, fit: bool, foreground: bool):
+def run_desktop_mode(video_path: Path, unmute: bool, fit: bool, foreground: bool, speed: float = 1.0):
     """Launches the desktop video/GIF wallpaper behind desktop icons."""
     binary_path = ensure_compiled_binary()
     stop_existing_desktop_player()
@@ -897,6 +1082,8 @@ def run_desktop_mode(video_path: Path, unmute: bool, fit: bool, foreground: bool
         cmd.append("--unmute")
     if fit:
         cmd.append("--fit")
+    if speed != 1.0:
+        cmd.extend(["--speed", str(speed)])
 
     if foreground:
         print(f"[*] Playing '{video_path.name}' on Desktop background (Ctrl+C to stop)...")
@@ -927,6 +1114,7 @@ def configure_startup_launch_agent(
     video_path: Path | None,
     unmute: bool = False,
     fit: bool = False,
+    speed: float = 1.0,
     enable: bool = True,
 ):
     """
@@ -968,6 +1156,8 @@ def configure_startup_launch_agent(
         prog_args.append("--unmute")
     if fit:
         prog_args.append("--fit")
+    if speed != 1.0:
+        prog_args.extend(["--speed", str(speed)])
 
     plist_data = {
         "Label": "com.macground.desktop",
@@ -1445,6 +1635,12 @@ def main():
         help="Keep desktop player attached to the terminal instead of running in the background.",
     )
     parser.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help="Playback speed multiplier for video wallpaper (e.g. 0.5 for half speed, 0.75 for cinematic slow-mo).",
+    )
+    parser.add_argument(
         "--startup",
         action="store_true",
         help="Automatically launch this wallpaper on user login via ~/Library/LaunchAgents.",
@@ -1506,10 +1702,10 @@ def main():
         sys.exit(1)
 
     if args.startup:
-        configure_startup_launch_agent(video_path, unmute=args.unmute, fit=args.fit, enable=True)
+        configure_startup_launch_agent(video_path, unmute=args.unmute, fit=args.fit, speed=args.speed, enable=True)
 
     if args.mode in ("desktop", "both"):
-        run_desktop_mode(video_path, unmute=args.unmute, fit=args.fit, foreground=args.foreground)
+        run_desktop_mode(video_path, unmute=args.unmute, fit=args.fit, foreground=args.foreground, speed=args.speed)
 
     if args.mode in ("lockscreen", "both"):
         apply_lockscreen_aerial(video_path, target_id=args.target_id)

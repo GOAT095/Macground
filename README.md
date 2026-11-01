@@ -20,7 +20,13 @@ Most macOS live wallpaper tools only work on the Desktop, require heavy third-pa
 **Macground** solves both Desktop and Lock Screen live wallpapers in a single, zero-dependency Python script:
 
 - **🖥️ True Desktop Video & GIF Layer (`--mode desktop`):** Compiles a lightweight native macOS `Cocoa` + `AVFoundation` helper on the fly that pins a borderless, click-through video (`AVPlayerLooper`) or animated GIF (`NSImageView`) window strictly behind your desktop icons (`kCGDesktopWindowLevel`) across all Spaces and monitors at full native 60 FPS. Features **intelligent auto-pause** when windows/fullscreen apps completely cover the desktop, on display sleep, or on screen lock, dropping CPU to 0.0% and conserving battery.
-- **🎬 System Menu Bar Controls (`NSStatusItem`):** Adds a native macOS status bar item (`🎬`) in the top-right menu bar for one-click control: view active wallpaper filename, toggle Pause/Resume, toggle Mute/Unmute audio on the fly, and cleanly exit.
+- **🎬 System Menu Bar Controls (`NSStatusItem`):** Adds a native macOS status bar item (`🎬`) in the top-right menu bar for one-click control:
+  - **Change Wallpaper...:** Launches a native macOS file dialog (`NSOpenPanel`) to browse and swap wallpapers directly from Finder.
+  - **Recent Wallpapers:** Fast one-click switching between your recently used wallpapers.
+  - **Playback Speed Control:** Toggle between 0.25x, 0.5x, 0.75x, 1.0x, 1.25x, 1.5x, and 2.0x on the fly.
+  - **Pause / Resume & Mute / Unmute:** Instant playback and sound toggles.
+  - **Stop Wallpaper:** Cleanly exits the background process.
+- **⏱️ Cinematic Slow-Mo & Speed Multipliers (`--speed`):** Adjust video speed (e.g. `--speed 0.5` or `--speed 0.75`) to turn fast or looping scenes into smooth, ambient background motion.
 - **🚀 Launch at Login (`--startup` / `--no-startup`):** Auto-starts your chosen desktop wallpaper upon user login using a lightweight native user LaunchAgent (`~/Library/LaunchAgents/com.macground.desktop.plist`), completely independent of terminal sessions.
 - **🔒 Native 4K @ 60 FPS Lock Screen Engine (`--mode lockscreen`):** Encodes your videos at native 4K UHD resolution (`3840x2160`) at a silky-smooth **60 FPS** with high-bitrate HEVC compression (~50 Mbps target). Features **Direct GPU Buffer Transfer** (zero CPU memcpy) matching Apple's native `4KSDR240FPS` Aerial format, hardlinking (`os.link`) the result across all Aerial slots so it uses 0 extra disk space and encodes in seconds.
 - **🎞️ Built-In Animated `.gif` Engine:** Renders `.gif` files natively via `AppKit` on the Desktop with zero conversion delay, and automatically converts `.gif` files into hardware-accelerated QuickTime `.mov` loops for the Lock Screen using native macOS `ImageIO` + `AVFoundation`.
@@ -72,6 +78,7 @@ usage: Macground.py [-h] [--mode {both,desktop,lockscreen}]
 | `python3 Macground.py file.mp4 --mode desktop` | Play video or `.gif` on the Desktop background only (behind desktop icons, across all Spaces and monitors). | No |
 | `sudo python3 Macground.py file.mp4` | Apply to **both** the Desktop background and the macOS Lock Screen (`--mode both` is default). | Yes |
 | `sudo python3 Macground.py file.mp4 --mode lockscreen` | Install video or `.gif` into the native macOS Lock Screen Aerial engine only. | Yes |
+| `--speed 0.5` | Set custom playback speed multiplier (e.g. 0.5 for half-speed slow-mo, 0.75 for cinematic). | No |
 | `--startup` | Auto-start the desktop wallpaper on login via `~/Library/LaunchAgents/com.macground.desktop.plist`. | No |
 | `--no-startup` | Disable auto-start on login and remove the LaunchAgent. | No |
 | `--unmute` | Enable audio playback in Desktop mode (muted by default). | No |
