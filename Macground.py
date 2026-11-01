@@ -278,6 +278,48 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
 
         evaluatePlaybackState()
         setupStatusBarItem()
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.syncLockScreen(mediaURL: url)
+        }
+    }
+
+    func syncLockScreen(mediaURL: URL) {
+        let reqFile = "/tmp/.macground_lockscreen_request"
+        try? mediaURL.path.write(toFile: reqFile, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o666], ofItemAtPath: reqFile)
+
+        let scriptPath: String = {
+            if let idx = CommandLine.arguments.firstIndex(of: "--script-path"), idx + 1 < CommandLine.arguments.count {
+                return CommandLine.arguments[idx + 1]
+            }
+            return URL(fileURLWithPath: CommandLine.arguments[0])
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Macground.py").path
+        }()
+
+        if FileManager.default.fileExists(atPath: scriptPath) {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            task.arguments = [scriptPath, mediaURL.path, "--mode", "lockscreen"]
+            task.standardOutput = FileHandle.nullDevice
+            task.standardError = FileHandle.nullDevice
+            try? task.run()
+            task.waitUntilExit()
+        }
+
+        let triggerPath = "/tmp/.macground_unlock_trigger"
+        try? "\(Date().timeIntervalSince1970)".write(toFile: triggerPath, atomically: true, encoding: .utf8)
+
+        for procName in ["WallpaperAerialsExtension", "WallpaperVideoExtension", "WallpaperAgent", "NeptuneOneWallpaper"] {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+            task.arguments = ["-9", procName]
+            task.standardOutput = FileHandle.nullDevice
+            task.standardError = FileHandle.nullDevice
+            try? task.run()
+        }
     }
 
     @objc func selectSpeed(_ sender: NSMenuItem) {
@@ -908,6 +950,7 @@ MODERN_AERIALS_4K_DIR = MODERN_AERIALS_ROOT / "4KSDR240FPS"
 LAUNCH_DAEMON_PLIST = Path("/Library/LaunchDaemons/com.macground.lockreset.plist")
 OLD_LAUNCH_DAEMON_PLIST = Path("/Library/LaunchDaemons/com.backimate.lockreset.plist")
 UNLOCK_TRIGGER_FILE = Path("/tmp/.macground_unlock_trigger")
+LOCKSCREEN_REQUEST_FILE = Path("/tmp/.macground_lockscreen_request")
 OLD_UNLOCK_TRIGGER_FILE = Path("/tmp/.backimate_unlock_trigger")
 
 HARDCODED_GOLDEN_GATE_ID = "4207734D-74FE-4F92-B5E1-6EC8DEE24A15"
@@ -990,14 +1033,21 @@ def install_root_watchpaths_daemon():
         UNLOCK_TRIGGER_FILE.write_text("init", encoding="utf-8")
         os.chmod(UNLOCK_TRIGGER_FILE, 0o666)
 
+        script_path = Path(__file__).resolve()
+        shell_cmd = (
+            'if [ -s "' + str(LOCKSCREEN_REQUEST_FILE) + '" ]; then '
+            'REQ=$(cat "' + str(LOCKSCREEN_REQUEST_FILE) + '" 2>/dev/null); '
+            'rm -f "' + str(LOCKSCREEN_REQUEST_FILE) + '"; '
+            'if [ -n "$REQ" ] && [ -f "$REQ" ]; then '
+            '/usr/bin/python3 "' + str(script_path) + '" "$REQ" --mode lockscreen >> /tmp/macground_lockscreen.log 2>&1; '
+            'fi; '
+            'fi; '
+            '/usr/bin/killall -9 WallpaperAerialsExtension WallpaperVideoExtension idleassetsd WallpaperAgent 2>/dev/null || true'
+        )
         plist_content = {
             "Label": "com.macground.lockreset",
-            "ProgramArguments": [
-                "/bin/sh",
-                "-c",
-                "/usr/bin/killall -9 WallpaperAerialsExtension WallpaperVideoExtension idleassetsd WallpaperAgent 2>/dev/null || true",
-            ],
-            "WatchPaths": [str(UNLOCK_TRIGGER_FILE)],
+            "ProgramArguments": ["/bin/sh", "-c", shell_cmd],
+            "WatchPaths": [str(UNLOCK_TRIGGER_FILE), str(LOCKSCREEN_REQUEST_FILE)],
         }
         with LAUNCH_DAEMON_PLIST.open("wb") as f:
             plistlib.dump(plist_content, f)
@@ -1078,6 +1128,7 @@ def run_desktop_mode(video_path: Path, unmute: bool, fit: bool, foreground: bool
         cmd.extend(["sudo", "-u", sudo_user])
 
     cmd.extend([str(binary_path), str(video_path.resolve())])
+    cmd.extend(["--script-path", str(Path(__file__).resolve())])
     if unmute:
         cmd.append("--unmute")
     if fit:
@@ -1152,6 +1203,7 @@ def configure_startup_launch_agent(
     launch_agents_dir.mkdir(parents=True, exist_ok=True)
 
     prog_args = [str(binary_path.resolve()), str(video_path.resolve())]
+    prog_args.extend(["--script-path", str(Path(__file__).resolve())])
     if unmute:
         prog_args.append("--unmute")
     if fit:
@@ -1386,13 +1438,63 @@ def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
     """
     playable_mov = prepare_lockscreen_mov(video_path)
 
+    if target_id:
+        clean_target = target_id[:-4] if target_id.endswith(".mov") else target_id
+        if clean_target.upper() == HARDCODED_GOLDEN_GATE_ID:
+            primary_id = PRIMARY_DEFAULT_ID
+        else:
+            primary_id = clean_target
+    else:
+        primary_id = PRIMARY_DEFAULT_ID
+
     if os.geteuid() != 0:
-        print("[*] Elevating privileges with sudo to install Lock Screen wallpaper...")
-        cmd = ["sudo", sys.executable, str(Path(__file__).resolve()), str(playable_mov), "--mode", "lockscreen"]
-        if target_id:
-            cmd.extend(["--target-id", target_id])
-        res = subprocess.run(cmd)
-        sys.exit(res.returncode)
+        # 1. Update user-owned Index.plist immediately
+        discovered_ids = activate_aerial_in_user_index_plist(primary_id)
+        target_ids = []
+        for aid in [primary_id] + BUILTIN_SLOTS_TO_POPULATE + discovered_ids:
+            if aid and aid not in target_ids:
+                target_ids.append(aid)
+
+        user_home = get_target_user_home()
+        user_app_support_aerials = user_home / "Library" / "Application Support" / "com.apple.wallpaper" / "aerials"
+        user_container_aerials = user_home / "Library" / "Containers" / "com.apple.wallpaper.extension.aerials" / "Data" / "Library" / "Application Support" / "com.apple.wallpaper" / "aerials"
+        user_dirs = [user_app_support_aerials, user_app_support_aerials / "videos", user_app_support_aerials / "4KSDR240FPS"]
+        if user_container_aerials.parent.exists():
+            user_dirs.extend([user_container_aerials, user_container_aerials / "videos", user_container_aerials / "4KSDR240FPS"])
+
+        master_u_mov: Path | None = None
+        for d in user_dirs:
+            try:
+                for aid in target_ids:
+                    dst = d / f"{aid}.mov"
+                    if master_u_mov is None:
+                        install_mov_to_destination(playable_mov, dst, uid=os.getuid(), gid=os.getgid(), is_first=True)
+                        master_u_mov = dst
+                    else:
+                        install_mov_to_destination(master_u_mov, dst, uid=os.getuid(), gid=os.getgid(), is_first=False)
+            except Exception:
+                pass
+
+        # 2. Touch /tmp/.macground_lockscreen_request for root LaunchDaemon to sync system slots
+        try:
+            LOCKSCREEN_REQUEST_FILE.write_text(str(video_path.resolve()), encoding="utf-8")
+            os.chmod(LOCKSCREEN_REQUEST_FILE, 0o666)
+        except Exception:
+            pass
+
+        # 3. Restart user wallpaper extensions
+        for daemon in ["WallpaperAerialsExtension", "WallpaperVideoExtension", "WallpaperAgent", "NeptuneOneWallpaper"]:
+            subprocess.run(["killall", "-9", daemon], stderr=subprocess.DEVNULL)
+
+        if sys.stdin.isatty():
+            print("[*] Elevating privileges with sudo to install Lock Screen wallpaper system-wide...")
+            cmd = ["sudo", sys.executable, str(Path(__file__).resolve()), str(playable_mov), "--mode", "lockscreen"]
+            if target_id:
+                cmd.extend(["--target-id", target_id])
+            res = subprocess.run(cmd)
+            sys.exit(res.returncode)
+        else:
+            return
 
     if target_id:
         clean_target = target_id[:-4] if target_id.endswith(".mov") else target_id

@@ -21,8 +21,8 @@ Most macOS live wallpaper tools only work on the Desktop, require heavy third-pa
 
 - **🖥️ True Desktop Video & GIF Layer (`--mode desktop`):** Compiles a lightweight native macOS `Cocoa` + `AVFoundation` helper on the fly that pins a borderless, click-through video (`AVPlayerLooper`) or animated GIF (`NSImageView`) window strictly behind your desktop icons (`kCGDesktopWindowLevel`) across all Spaces and monitors at full native 60 FPS. Features **intelligent auto-pause** when windows/fullscreen apps completely cover the desktop, on display sleep, or on screen lock, dropping CPU to 0.0% and conserving battery.
 - **🎬 System Menu Bar Controls (`NSStatusItem`):** Adds a native macOS status bar item (`🎬`) in the top-right menu bar for one-click control:
-  - **Change Wallpaper...:** Launches a native macOS file dialog (`NSOpenPanel`) to browse and swap wallpapers directly from Finder.
-  - **Recent Wallpapers:** Fast one-click switching between your recently used wallpapers.
+  - **Change Wallpaper...:** Launches a native macOS file dialog (`NSOpenPanel`) to browse and swap wallpapers directly from Finder. Automatically syncs to **both** your Desktop and Lock Screen in real time.
+  - **Recent Wallpapers:** Fast one-click switching between your recently used wallpapers (syncs across Desktop and Lock Screen).
   - **Playback Speed Control:** Toggle between 0.25x, 0.5x, 0.75x, 1.0x, 1.25x, 1.5x, and 2.0x on the fly.
   - **Pause / Resume & Mute / Unmute:** Instant playback and sound toggles.
   - **Stop Wallpaper:** Cleanly exits the background process.
