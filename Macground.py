@@ -22,8 +22,13 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
     var windows: [NSWindow] = []
     var players: [AVQueuePlayer] = []
     var loopers: [AVPlayerLooper] = []
+    var imageViews: [NSImageView] = []
+    var statusItem: NSStatusItem?
+    var playPauseMenuItem: NSMenuItem?
+    var muteMenuItem: NSMenuItem?
+    var userManuallyPaused = false
     let mediaURL: URL
-    let isMuted: Bool
+    var isMuted: Bool
     let fillScreen: Bool
     let isGIF: Bool
 
@@ -40,6 +45,7 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupWindows()
+        setupStatusBarItem()
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(screensDidChange),
@@ -84,11 +90,69 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    func setupStatusBarItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem?.button {
+            button.title = "🎬"
+            button.toolTip = "Macground: \(mediaURL.lastPathComponent)"
+        }
+        let menu = NSMenu()
+        let titleItem = NSMenuItem(title: "🎬 Macground: \(mediaURL.lastPathComponent)", action: nil, keyEquivalent: "")
+        titleItem.isEnabled = false
+        menu.addItem(titleItem)
+        menu.addItem(NSMenuItem.separator())
+
+        playPauseMenuItem = NSMenuItem(title: "Pause Wallpaper", action: #selector(togglePlayPause), keyEquivalent: "p")
+        playPauseMenuItem?.target = self
+        menu.addItem(playPauseMenuItem!)
+
+        if !isGIF {
+            muteMenuItem = NSMenuItem(title: isMuted ? "Unmute Audio" : "Mute Audio", action: #selector(toggleMute), keyEquivalent: "m")
+            muteMenuItem?.target = self
+            menu.addItem(muteMenuItem!)
+        }
+
+        menu.addItem(NSMenuItem.separator())
+        let quitItem = NSMenuItem(title: "Stop Wallpaper", action: #selector(quitApp), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+
+        statusItem?.menu = menu
+    }
+
+    @objc func togglePlayPause() {
+        let isCurrentlyPlaying = isGIF ? (imageViews.first?.animates ?? true) : players.contains { p in p.rate > 0 }
+        if isCurrentlyPlaying {
+            userManuallyPaused = true
+            pauseAllPlayers()
+            playPauseMenuItem?.title = "Resume Wallpaper"
+        } else {
+            userManuallyPaused = false
+            resumeAllPlayers()
+            playPauseMenuItem?.title = "Pause Wallpaper"
+        }
+    }
+
+    @objc func toggleMute() {
+        isMuted = !isMuted
+        for player in players {
+            player.isMuted = isMuted
+        }
+        muteMenuItem?.title = isMuted ? "Unmute Audio" : "Mute Audio"
+    }
+
+    @objc func quitApp() {
+        NSApp.terminate(nil)
+    }
+
     func pauseAllPlayers() {
         for player in players {
             if player.rate != 0 {
                 player.pause()
             }
+        }
+        for iv in imageViews {
+            iv.animates = false
         }
     }
 
@@ -98,10 +162,13 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
                 player.play()
             }
         }
+        for iv in imageViews {
+            iv.animates = true
+        }
     }
 
     func evaluatePlaybackState() {
-        if isScreenLocked || isDisplayAsleep {
+        if userManuallyPaused || isScreenLocked || isDisplayAsleep {
             pauseAllPlayers()
             return
         }
@@ -109,8 +176,10 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         let isAnyVisible = windows.isEmpty ? true : windows.contains { w in w.occlusionState.contains(.visible) }
         if isAnyVisible {
             resumeAllPlayers()
+            playPauseMenuItem?.title = "Pause Wallpaper"
         } else {
             pauseAllPlayers()
+            playPauseMenuItem?.title = "Resume Wallpaper"
         }
     }
 
@@ -165,6 +234,7 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         windows.removeAll()
         players.removeAll()
         loopers.removeAll()
+        imageViews.removeAll()
         setupWindows()
     }
 
@@ -221,6 +291,7 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
                     imageView.imageScaling = .scaleProportionallyUpOrDown
                 }
 
+                imageViews.append(imageView)
                 containerView.addSubview(imageView)
                 window.contentView = containerView
                 window.orderFrontRegardless()
@@ -852,6 +923,76 @@ def get_target_user_home() -> Path:
     return Path.home()
 
 
+def configure_startup_launch_agent(
+    video_path: Path | None,
+    unmute: bool = False,
+    fit: bool = False,
+    enable: bool = True,
+):
+    """
+    Configures or removes ~/Library/LaunchAgents/com.macground.desktop.plist
+    to automatically start the Desktop video/GIF wallpaper upon user login.
+    """
+    user_home = get_target_user_home()
+    launch_agents_dir = user_home / "Library" / "LaunchAgents"
+    plist_path = launch_agents_dir / "com.macground.desktop.plist"
+
+    sudo_user = os.environ.get("SUDO_USER")
+    is_sudo = os.geteuid() == 0 and sudo_user and sudo_user != "root"
+
+    def run_as_user(args_list):
+        if is_sudo:
+            return subprocess.run(["sudo", "-u", sudo_user] + args_list, capture_output=True, text=True)
+        return subprocess.run(args_list, capture_output=True, text=True)
+
+    if plist_path.exists():
+        run_as_user(["launchctl", "unload", str(plist_path)])
+
+    if not enable:
+        if plist_path.exists():
+            plist_path.unlink(missing_ok=True)
+            print("[+] Disabled launch-at-login (removed com.macground.desktop.plist).")
+        else:
+            print("[*] Launch-at-login is already disabled.")
+        return
+
+    if not video_path:
+        print("[!] Error: A video or GIF path is required to enable launch-at-login.", file=sys.stderr)
+        sys.exit(1)
+
+    binary_path = ensure_compiled_binary()
+    launch_agents_dir.mkdir(parents=True, exist_ok=True)
+
+    prog_args = [str(binary_path.resolve()), str(video_path.resolve())]
+    if unmute:
+        prog_args.append("--unmute")
+    if fit:
+        prog_args.append("--fit")
+
+    plist_data = {
+        "Label": "com.macground.desktop",
+        "ProgramArguments": prog_args,
+        "RunAtLoad": True,
+        "KeepAlive": False,
+        "ProcessType": "Interactive",
+    }
+
+    with plist_path.open("wb") as f:
+        plistlib.dump(plist_data, f)
+
+    if is_sudo:
+        sudo_uid = int(os.environ.get("SUDO_UID", 501))
+        sudo_gid = int(os.environ.get("SUDO_GID", 20))
+        try:
+            os.chown(plist_path, sudo_uid, sudo_gid)
+        except Exception:
+            pass
+
+    run_as_user(["launchctl", "load", "-w", str(plist_path)])
+    print(f"[+] Enabled launch-at-login: '{video_path.name}' will start automatically at login.")
+    print(f"    Installed LaunchAgent: {plist_path}")
+
+
 def list_downloaded_aerials() -> list[tuple[str, Path]]:
     """Finds downloaded macOS Aerial wallpaper `.mov` files across both legacy and modern paths."""
     found = []
@@ -1304,6 +1445,16 @@ def main():
         help="Keep desktop player attached to the terminal instead of running in the background.",
     )
     parser.add_argument(
+        "--startup",
+        action="store_true",
+        help="Automatically launch this wallpaper on user login via ~/Library/LaunchAgents.",
+    )
+    parser.add_argument(
+        "--no-startup",
+        action="store_true",
+        help="Disable auto-start at login and remove ~/Library/LaunchAgents/com.macground.desktop.plist.",
+    )
+    parser.add_argument(
         "--stop",
         action="store_true",
         help="Stop the running desktop wallpaper background process.",
@@ -1320,6 +1471,11 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.no_startup:
+        configure_startup_launch_agent(None, enable=False)
+        if not args.video:
+            return
 
     if args.stop:
         stop_existing_desktop_player()
@@ -1348,6 +1504,9 @@ def main():
     if not video_path.exists():
         print(f"[!] Error: Media file not found: {video_path}", file=sys.stderr)
         sys.exit(1)
+
+    if args.startup:
+        configure_startup_launch_agent(video_path, unmute=args.unmute, fit=args.fit, enable=True)
 
     if args.mode in ("desktop", "both"):
         run_desktop_mode(video_path, unmute=args.unmute, fit=args.fit, foreground=args.foreground)

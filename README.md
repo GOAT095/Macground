@@ -20,6 +20,8 @@ Most macOS live wallpaper tools only work on the Desktop, require heavy third-pa
 **Macground** solves both Desktop and Lock Screen live wallpapers in a single, zero-dependency Python script:
 
 - **🖥️ True Desktop Video & GIF Layer (`--mode desktop`):** Compiles a lightweight native macOS `Cocoa` + `AVFoundation` helper on the fly that pins a borderless, click-through video (`AVPlayerLooper`) or animated GIF (`NSImageView`) window strictly behind your desktop icons (`kCGDesktopWindowLevel`) across all Spaces and monitors at full native 60 FPS. Features **intelligent auto-pause** when windows/fullscreen apps completely cover the desktop, on display sleep, or on screen lock, dropping CPU to 0.0% and conserving battery.
+- **🎬 System Menu Bar Controls (`NSStatusItem`):** Adds a native macOS status bar item (`🎬`) in the top-right menu bar for one-click control: view active wallpaper filename, toggle Pause/Resume, toggle Mute/Unmute audio on the fly, and cleanly exit.
+- **🚀 Launch at Login (`--startup` / `--no-startup`):** Auto-starts your chosen desktop wallpaper upon user login using a lightweight native user LaunchAgent (`~/Library/LaunchAgents/com.macground.desktop.plist`), completely independent of terminal sessions.
 - **🔒 Native 4K @ 60 FPS Lock Screen Engine (`--mode lockscreen`):** Encodes your videos at native 4K UHD resolution (`3840x2160`) at a silky-smooth **60 FPS** with high-bitrate HEVC compression (~50 Mbps target). Features **Direct GPU Buffer Transfer** (zero CPU memcpy) matching Apple's native `4KSDR240FPS` Aerial format, hardlinking (`os.link`) the result across all Aerial slots so it uses 0 extra disk space and encodes in seconds.
 - **🎞️ Built-In Animated `.gif` Engine:** Renders `.gif` files natively via `AppKit` on the Desktop with zero conversion delay, and automatically converts `.gif` files into hardware-accelerated QuickTime `.mov` loops for the Lock Screen using native macOS `ImageIO` + `AVFoundation`.
 - **🪶 Zero `pip` Dependencies:** Uses only the Python standard library and macOS's built-in Xcode Command Line Tools (`xcrun swiftc`).
@@ -70,6 +72,8 @@ usage: Macground.py [-h] [--mode {both,desktop,lockscreen}]
 | `python3 Macground.py file.mp4 --mode desktop` | Play video or `.gif` on the Desktop background only (behind desktop icons, across all Spaces and monitors). | No |
 | `sudo python3 Macground.py file.mp4` | Apply to **both** the Desktop background and the macOS Lock Screen (`--mode both` is default). | Yes |
 | `sudo python3 Macground.py file.mp4 --mode lockscreen` | Install video or `.gif` into the native macOS Lock Screen Aerial engine only. | Yes |
+| `--startup` | Auto-start the desktop wallpaper on login via `~/Library/LaunchAgents/com.macground.desktop.plist`. | No |
+| `--no-startup` | Disable auto-start on login and remove the LaunchAgent. | No |
 | `--unmute` | Enable audio playback in Desktop mode (muted by default). | No |
 | `--fit` | Letterbox/fit the video or GIF inside screen bounds instead of aspect-filling the screen. | No |
 | `--foreground` | Keep the Desktop player attached to your terminal window (`Ctrl+C` to stop) instead of daemonizing in the background. | No |
