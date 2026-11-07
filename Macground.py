@@ -26,10 +26,8 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
     var imageViews: [NSImageView] = []
     var statusItem: NSStatusItem?
     var playPauseMenuItem: NSMenuItem?
-    var muteMenuItem: NSMenuItem?
     var userManuallyPaused = false
     var mediaURL: URL
-    var isMuted: Bool
     let fillScreen: Bool
     var isGIF: Bool
     var currentSpeed: Float
@@ -42,9 +40,8 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         return home.appendingPathComponent(".macground_recents.json")
     }
 
-    init(mediaURL: URL, isMuted: Bool, fillScreen: Bool, speed: Float) {
+    init(mediaURL: URL, fillScreen: Bool, speed: Float) {
         self.mediaURL = mediaURL
-        self.isMuted = isMuted
         self.fillScreen = fillScreen
         self.currentSpeed = max(0.1, min(4.0, speed))
         self.isGIF = mediaURL.pathExtension.lowercased() == "gif"
@@ -79,7 +76,6 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         var newArgs: [String] = [CommandLine.arguments[0], mediaURL.path]
-        if !isMuted { newArgs.append("--unmute") }
         if !fillScreen { newArgs.append("--fit") }
         if currentSpeed != 1.0 { newArgs.append(contentsOf: ["--speed", String(format: "%.2f", currentSpeed)]) }
         plist["ProgramArguments"] = newArgs
@@ -141,19 +137,40 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
             statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         }
         if let button = statusItem?.button {
-            button.title = "🎬"
+            button.title = ""
+            let icon: NSImage? = {
+                if let img = NSImage(systemSymbolName: "play.desktopcomputer", accessibilityDescription: "Macground") {
+                    return img
+                }
+                if let img = NSImage(systemSymbolName: "display", accessibilityDescription: "Macground") {
+                    return img
+                }
+                return NSImage(systemSymbolName: "photo.tv", accessibilityDescription: "Macground")
+            }()
+            if let icon = icon {
+                icon.isTemplate = true
+                button.image = icon
+                button.imagePosition = .imageOnly
+            } else {
+                button.title = "🖥"
+            }
             button.toolTip = "Macground: \(mediaURL.lastPathComponent)"
         }
         let menu = NSMenu()
         menu.autoenablesItems = false
 
-        let titleItem = NSMenuItem(title: "🎬 Macground: \(mediaURL.lastPathComponent)", action: nil, keyEquivalent: "")
+        let titleItem = NSMenuItem(title: "Macground", action: nil, keyEquivalent: "")
         titleItem.isEnabled = false
         menu.addItem(titleItem)
+
+        let currentItem = NSMenuItem(title: "Current: \(mediaURL.lastPathComponent)", action: nil, keyEquivalent: "")
+        currentItem.isEnabled = false
+        menu.addItem(currentItem)
         menu.addItem(NSMenuItem.separator())
 
         let changeItem = NSMenuItem(title: "Change Wallpaper...", action: #selector(openWallpaperFilePicker), keyEquivalent: "o")
         changeItem.target = self
+        changeItem.image = NSImage(systemSymbolName: "photo.badge.plus", accessibilityDescription: nil)
         menu.addItem(changeItem)
 
         let recentsMenu = NSMenu()
@@ -177,9 +194,11 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
             recentsMenu.addItem(NSMenuItem.separator())
             let clearItem = NSMenuItem(title: "Clear Recents", action: #selector(clearRecents), keyEquivalent: "")
             clearItem.target = self
+            clearItem.image = NSImage(systemSymbolName: "trash", accessibilityDescription: nil)
             recentsMenu.addItem(clearItem)
         }
         let recentsParentItem = NSMenuItem(title: "Recent Wallpapers", action: nil, keyEquivalent: "")
+        recentsParentItem.image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: nil)
         recentsParentItem.submenu = recentsMenu
         menu.addItem(recentsParentItem)
 
@@ -191,6 +210,7 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: "p"
         )
         playPauseMenuItem?.target = self
+        playPauseMenuItem?.image = NSImage(systemSymbolName: userManuallyPaused ? "play.fill" : "pause.fill", accessibilityDescription: nil)
         menu.addItem(playPauseMenuItem!)
 
         let speedMenu = NSMenu()
@@ -213,21 +233,18 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
             speedMenu.addItem(item)
         }
         let speedParentItem = NSMenuItem(title: "Playback Speed (\(String(format: "%.2fx", currentSpeed)))", action: nil, keyEquivalent: "")
+        speedParentItem.image = NSImage(systemSymbolName: "speedometer", accessibilityDescription: nil)
         speedParentItem.submenu = speedMenu
         if isGIF {
             speedParentItem.isEnabled = false
         }
         menu.addItem(speedParentItem)
 
-        if !isGIF {
-            muteMenuItem = NSMenuItem(title: isMuted ? "Unmute Audio" : "Mute Audio", action: #selector(toggleMute), keyEquivalent: "m")
-            muteMenuItem?.target = self
-            menu.addItem(muteMenuItem!)
-        }
 
         menu.addItem(NSMenuItem.separator())
         let quitItem = NSMenuItem(title: "Stop Wallpaper", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
+        quitItem.image = NSImage(systemSymbolName: "power", accessibilityDescription: nil)
         menu.addItem(quitItem)
 
         statusItem?.menu = menu
@@ -342,21 +359,15 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
             userManuallyPaused = true
             pauseAllPlayers()
             playPauseMenuItem?.title = "Resume Wallpaper"
+            playPauseMenuItem?.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: nil)
         } else {
             userManuallyPaused = false
             resumeAllPlayers()
             playPauseMenuItem?.title = "Pause Wallpaper"
+            playPauseMenuItem?.image = NSImage(systemSymbolName: "pause.fill", accessibilityDescription: nil)
         }
     }
 
-    @objc func toggleMute() {
-        isMuted = !isMuted
-        for player in players {
-            player.isMuted = isMuted
-        }
-        muteMenuItem?.title = isMuted ? "Unmute Audio" : "Mute Audio"
-        updateLaunchAgentIfPresent()
-    }
 
     @objc func quitApp() {
         NSApp.terminate(nil)
@@ -394,9 +405,11 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         if isAnyVisible {
             resumeAllPlayers()
             playPauseMenuItem?.title = "Pause Wallpaper"
+            playPauseMenuItem?.image = NSImage(systemSymbolName: "pause.fill", accessibilityDescription: nil)
         } else {
             pauseAllPlayers()
             playPauseMenuItem?.title = "Resume Wallpaper"
+            playPauseMenuItem?.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: nil)
         }
     }
 
@@ -523,7 +536,7 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
 
             let playerItem = AVPlayerItem(asset: asset)
             let queuePlayer = AVQueuePlayer(playerItem: playerItem)
-            queuePlayer.isMuted = isMuted
+            queuePlayer.isMuted = true
             queuePlayer.defaultRate = currentSpeed
             queuePlayer.preventsDisplaySleepDuringVideoPlayback = false
 
@@ -550,12 +563,11 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
 
 let args = CommandLine.arguments
 guard args.count >= 2 else {
-    fputs("Usage: desktop_video_player <media_path> [--unmute] [--fit] [--speed <float>]\n", stderr)
+    fputs("Usage: desktop_video_player <media_path> [--fit] [--speed <float>]\n", stderr)
     exit(1)
 }
 
 let mediaPath = args[1]
-let isMuted = !args.contains("--unmute")
 let fillScreen = !args.contains("--fit")
 var speed: Float = 1.0
 if let speedIdx = args.firstIndex(of: "--speed"), speedIdx + 1 < args.count {
@@ -572,7 +584,7 @@ guard FileManager.default.fileExists(atPath: url.path) else {
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-let delegate = WallpaperAppDelegate(mediaURL: url, isMuted: isMuted, fillScreen: fillScreen, speed: speed)
+let delegate = WallpaperAppDelegate(mediaURL: url, fillScreen: fillScreen, speed: speed)
 app.delegate = delegate
 app.run()
 """
@@ -1117,7 +1129,7 @@ def stop_existing_desktop_player():
     subprocess.run(["pkill", "-f", "desktop_video_player"], stderr=subprocess.DEVNULL)
 
 
-def run_desktop_mode(video_path: Path, unmute: bool, fit: bool, foreground: bool, speed: float = 1.0):
+def run_desktop_mode(video_path: Path, fit: bool, foreground: bool, speed: float = 1.0):
     """Launches the desktop video/GIF wallpaper behind desktop icons."""
     binary_path = ensure_compiled_binary()
     stop_existing_desktop_player()
@@ -1129,8 +1141,6 @@ def run_desktop_mode(video_path: Path, unmute: bool, fit: bool, foreground: bool
 
     cmd.extend([str(binary_path), str(video_path.resolve())])
     cmd.extend(["--script-path", str(Path(__file__).resolve())])
-    if unmute:
-        cmd.append("--unmute")
     if fit:
         cmd.append("--fit")
     if speed != 1.0:
@@ -1163,7 +1173,6 @@ def get_target_user_home() -> Path:
 
 def configure_startup_launch_agent(
     video_path: Path | None,
-    unmute: bool = False,
     fit: bool = False,
     speed: float = 1.0,
     enable: bool = True,
@@ -1204,8 +1213,6 @@ def configure_startup_launch_agent(
 
     prog_args = [str(binary_path.resolve()), str(video_path.resolve())]
     prog_args.extend(["--script-path", str(Path(__file__).resolve())])
-    if unmute:
-        prog_args.append("--unmute")
     if fit:
         prog_args.append("--fit")
     if speed != 1.0:
@@ -1722,11 +1729,6 @@ def main():
         help="Optional specific Aerial UUID to replace for Lock Screen mode.",
     )
     parser.add_argument(
-        "--unmute",
-        action="store_true",
-        help="Enable audio playback in desktop mode (muted by default).",
-    )
-    parser.add_argument(
         "--fit",
         action="store_true",
         help="Fit video/GIF inside screen bounds instead of filling/cropping (desktop mode).",
@@ -1804,10 +1806,10 @@ def main():
         sys.exit(1)
 
     if args.startup:
-        configure_startup_launch_agent(video_path, unmute=args.unmute, fit=args.fit, speed=args.speed, enable=True)
+        configure_startup_launch_agent(video_path, fit=args.fit, speed=args.speed, enable=True)
 
     if args.mode in ("desktop", "both"):
-        run_desktop_mode(video_path, unmute=args.unmute, fit=args.fit, foreground=args.foreground, speed=args.speed)
+        run_desktop_mode(video_path, fit=args.fit, foreground=args.foreground, speed=args.speed)
 
     if args.mode in ("lockscreen", "both"):
         apply_lockscreen_aerial(video_path, target_id=args.target_id)

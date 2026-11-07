@@ -20,11 +20,11 @@ Most macOS live wallpaper tools only work on the Desktop, require heavy third-pa
 **Macground** solves both Desktop and Lock Screen live wallpapers in a single, zero-dependency Python script:
 
 - **🖥️ True Desktop Video & GIF Layer (`--mode desktop`):** Compiles a lightweight native macOS `Cocoa` + `AVFoundation` helper on the fly that pins a borderless, click-through video (`AVPlayerLooper`) or animated GIF (`NSImageView`) window strictly behind your desktop icons (`kCGDesktopWindowLevel`) across all Spaces and monitors at full native 60 FPS. Features **intelligent auto-pause** when windows/fullscreen apps completely cover the desktop, on display sleep, or on screen lock, dropping CPU to 0.0% and conserving battery.
-- **🎬 System Menu Bar Controls (`NSStatusItem`):** Adds a native macOS status bar item (`🎬`) in the top-right menu bar for one-click control:
+- **🖥️ Native macOS Menu Bar Controls (`NSStatusItem`):** Adds an Apple HIG-compliant monochrome template SF Symbol (`play.desktopcomputer`) in the top-right menu bar for one-click control:
   - **Change Wallpaper...:** Launches a native macOS file dialog (`NSOpenPanel`) to browse and swap wallpapers directly from Finder. Automatically syncs to **both** your Desktop and Lock Screen in real time.
   - **Recent Wallpapers:** Fast one-click switching between your recently used wallpapers (syncs across Desktop and Lock Screen).
   - **Playback Speed Control:** Toggle between 0.25x, 0.5x, 0.75x, 1.0x, 1.25x, 1.5x, and 2.0x on the fly.
-  - **Pause / Resume & Mute / Unmute:** Instant playback and sound toggles.
+  - **Pause / Resume:** Instant playback toggle.
   - **Stop Wallpaper:** Cleanly exits the background process.
 - **⏱️ Cinematic Slow-Mo & Speed Multipliers (`--speed`):** Adjust video speed (e.g. `--speed 0.5` or `--speed 0.75`) to turn fast or looping scenes into smooth, ambient background motion.
 - **🚀 Launch at Login (`--startup` / `--no-startup`):** Auto-starts your chosen desktop wallpaper upon user login using a lightweight native user LaunchAgent (`~/Library/LaunchAgents/com.macground.desktop.plist`), completely independent of terminal sessions.
@@ -67,7 +67,7 @@ sudo python3 Macground.py /path/to/your/animation.gif
 
 ```text
 usage: Macground.py [-h] [--mode {both,desktop,lockscreen}]
-                    [--target-id TARGET_ID] [--unmute] [--fit]
+                    [--target-id TARGET_ID] [--fit]
                     [--foreground] [--stop]
                     [--list-lockscreen-slots] [--restore-lockscreen]
                     [video]
@@ -81,7 +81,6 @@ usage: Macground.py [-h] [--mode {both,desktop,lockscreen}]
 | `--speed 0.5` | Set custom playback speed multiplier (e.g. 0.5 for half-speed slow-mo, 0.75 for cinematic). | No |
 | `--startup` | Auto-start the desktop wallpaper on login via `~/Library/LaunchAgents/com.macground.desktop.plist`. | No |
 | `--no-startup` | Disable auto-start on login and remove the LaunchAgent. | No |
-| `--unmute` | Enable audio playback in Desktop mode (muted by default). | No |
 | `--fit` | Letterbox/fit the video or GIF inside screen bounds instead of aspect-filling the screen. | No |
 | `--foreground` | Keep the Desktop player attached to your terminal window (`Ctrl+C` to stop) instead of daemonizing in the background. | No |
 | `python3 Macground.py --stop` | Stop the running background Desktop video/GIF wallpaper process. | No |
