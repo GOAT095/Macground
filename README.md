@@ -99,8 +99,7 @@ usage: Macground.py [-h] [--mode {both,desktop,lockscreen}]
                     [--stop] [--list-lockscreen-slots] [--restore-lockscreen]
                     [video]
 ```
-[[https://gitdiagram.com/diagram-badge.svg]](https://gitdiagram.com/goat095/macground?utm_source=readme&utm_medium=badge)
-| Flag | Description | Default | Requires `sudo`? |
+[![Architecture diagram of goat095/macground](https://gitdiagram.com/goat095/macground/diagram.png)](https://gitdiagram.com/goat095/macground?utm_source=readme&utm_medium=picture)| Flag | Description | Default | Requires `sudo`? |
 | :--- | :--- | :---: | :---: |
 | `video` | Path to a video file (`.mp4`, `.mov`, `.m4v`), GIF (`.gif`), or directory of wallpapers. | — | Mode dependent |
 | `--mode {both,desktop,lockscreen}` | Wallpaper target. `desktop` requires no sudo. | `both` | Yes for lockscreen/both |
