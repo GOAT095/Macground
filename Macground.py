@@ -8,8 +8,10 @@ import hashlib
 import json
 import os
 import plistlib
+import random
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +20,33 @@ SWIFT_DESKTOP_PLAYER_SOURCE = r"""
 import Cocoa
 import AVFoundation
 import UniformTypeIdentifiers
+import IOKit.ps
+
+func isRunningOnBattery() -> Bool {
+    guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+          let sources = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [CFTypeRef] else {
+        return false
+    }
+    for source in sources {
+        guard let desc = IOPSGetPowerSourceDescription(snapshot, source)?.takeUnretainedValue() as? [String: Any] else { continue }
+        if let state = desc[kIOPSPowerSourceStateKey as String] as? String {
+            if state == kIOPSBatteryPowerValue as String {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+func scanMediaFolder(dirURL: URL) -> [URL] {
+    let supported = Set(["mp4", "mov", "m4v", "gif"])
+    let fm = FileManager.default
+    guard let files = try? fm.contentsOfDirectory(at: dirURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else {
+        return []
+    }
+    return files.filter { supported.contains($0.pathExtension.lowercased()) }
+        .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+}
 
 class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
     var windows: [NSWindow] = []
@@ -35,16 +64,36 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
     var isScreenLocked = false
     var isDisplayAsleep = false
 
+    // Battery / Energy Saver
+    var pauseOnBattery: Bool = false
+    var pauseOnLowPower: Bool = true
+    var powerCheckTimer: Timer?
+
+    // Playlist & Auto-Rotation
+    var playlist: [URL] = []
+    var playlistIndex: Int = 0
+    var isShuffle: Bool = false
+    var rotationInterval: TimeInterval = 0 // 0 = disabled
+    var rotationTimer: Timer?
+
     var recentsURL: URL {
         let home = FileManager.default.homeDirectoryForCurrentUser
         return home.appendingPathComponent(".macground_recents.json")
     }
 
-    init(mediaURL: URL, fillScreen: Bool, speed: Float) {
+    init(mediaURL: URL, fillScreen: Bool, speed: Float, pauseOnBattery: Bool = false, pauseOnLowPower: Bool = true, playlist: [URL] = [], interval: TimeInterval = 0, shuffle: Bool = false) {
         self.mediaURL = mediaURL
         self.fillScreen = fillScreen
         self.currentSpeed = max(0.1, min(4.0, speed))
         self.isGIF = mediaURL.pathExtension.lowercased() == "gif"
+        self.pauseOnBattery = pauseOnBattery
+        self.pauseOnLowPower = pauseOnLowPower
+        self.playlist = playlist.isEmpty ? [mediaURL] : playlist
+        self.rotationInterval = interval
+        self.isShuffle = shuffle
+        if let idx = self.playlist.firstIndex(of: mediaURL) {
+            self.playlistIndex = idx
+        }
         super.init()
     }
 
@@ -59,8 +108,8 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
     func saveRecent(path: String) {
         var list = loadRecents().filter { p in p != path }
         list.insert(path, at: 0)
-        if list.count > 6 {
-            list = Array(list.prefix(6))
+        if list.count > 8 {
+            list = Array(list.prefix(8))
         }
         if let data = try? JSONEncoder().encode(list) {
             try? data.write(to: recentsURL)
@@ -78,6 +127,8 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         var newArgs: [String] = [CommandLine.arguments[0], mediaURL.path]
         if !fillScreen { newArgs.append("--fit") }
         if currentSpeed != 1.0 { newArgs.append(contentsOf: ["--speed", String(format: "%.2f", currentSpeed)]) }
+        if pauseOnBattery { newArgs.append("--pause-on-battery") }
+        if !pauseOnLowPower { newArgs.append("--no-pause-on-low-power") }
         plist["ProgramArguments"] = newArgs
         if let updatedData = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
             try? updatedData.write(to: plistURL)
@@ -88,6 +139,8 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         saveRecent(path: mediaURL.path)
         setupWindows()
         setupStatusBarItem()
+        restartRotationTimer()
+
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(screensDidChange),
@@ -130,6 +183,16 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
             name: NSNotification.Name("com.apple.screenIsLocked"),
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(powerStateDidChange),
+            name: Notification.Name.NSProcessInfoPowerStateDidChange,
+            object: nil
+        )
+
+        powerCheckTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            self?.evaluatePlaybackState()
+        }
     }
 
     func setupStatusBarItem() {
@@ -163,10 +226,54 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         titleItem.isEnabled = false
         menu.addItem(titleItem)
 
-        let currentItem = NSMenuItem(title: "Current: \(mediaURL.lastPathComponent)", action: nil, keyEquivalent: "")
+        let subtitle = playlist.count > 1 ? "\(mediaURL.lastPathComponent) (\(playlistIndex + 1)/\(playlist.count))" : mediaURL.lastPathComponent
+        let currentItem = NSMenuItem(title: "Current: \(subtitle)", action: nil, keyEquivalent: "")
         currentItem.isEnabled = false
         menu.addItem(currentItem)
         menu.addItem(NSMenuItem.separator())
+
+        if playlist.count > 1 {
+            let nextItem = NSMenuItem(title: "Next Wallpaper", action: #selector(playNextWallpaper), keyEquivalent: "n")
+            nextItem.target = self
+            nextItem.image = NSImage(systemSymbolName: "forward.fill", accessibilityDescription: nil)
+            menu.addItem(nextItem)
+
+            let prevItem = NSMenuItem(title: "Previous Wallpaper", action: #selector(playPreviousWallpaper), keyEquivalent: "b")
+            prevItem.target = self
+            prevItem.image = NSImage(systemSymbolName: "backward.fill", accessibilityDescription: nil)
+            menu.addItem(prevItem)
+
+            let shuffleItem = NSMenuItem(title: "Shuffle Playlist", action: #selector(toggleShuffle), keyEquivalent: "")
+            shuffleItem.target = self
+            shuffleItem.image = NSImage(systemSymbolName: "shuffle", accessibilityDescription: nil)
+            shuffleItem.state = isShuffle ? .on : .off
+            menu.addItem(shuffleItem)
+
+            let rotateMenu = NSMenu()
+            let intervals: [(String, TimeInterval)] = [
+                ("Off (Manual)", 0),
+                ("1 Minute", 60),
+                ("5 Minutes", 300),
+                ("15 Minutes", 900),
+                ("30 Minutes", 1800),
+                ("1 Hour", 3600)
+            ]
+            for (label, sec) in intervals {
+                let it = NSMenuItem(title: label, action: #selector(selectRotationInterval(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = NSNumber(value: sec)
+                if abs(rotationInterval - sec) < 1.0 {
+                    it.state = .on
+                }
+                rotateMenu.addItem(it)
+            }
+            let rotateParent = NSMenuItem(title: "Auto-Rotate Interval", action: nil, keyEquivalent: "")
+            rotateParent.image = NSImage(systemSymbolName: "timer", accessibilityDescription: nil)
+            rotateParent.submenu = rotateMenu
+            menu.addItem(rotateParent)
+
+            menu.addItem(NSMenuItem.separator())
+        }
 
         let changeItem = NSMenuItem(title: "Change Wallpaper...", action: #selector(openWallpaperFilePicker), keyEquivalent: "o")
         changeItem.target = self
@@ -201,6 +308,26 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         recentsParentItem.image = NSImage(systemSymbolName: "clock.arrow.circlepath", accessibilityDescription: nil)
         recentsParentItem.submenu = recentsMenu
         menu.addItem(recentsParentItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let batteryMenu = NSMenu()
+        let batteryToggleItem = NSMenuItem(title: "Pause on Battery Power", action: #selector(togglePauseOnBattery), keyEquivalent: "")
+        batteryToggleItem.target = self
+        batteryToggleItem.image = NSImage(systemSymbolName: "battery.50", accessibilityDescription: nil)
+        batteryToggleItem.state = pauseOnBattery ? .on : .off
+        batteryMenu.addItem(batteryToggleItem)
+
+        let lowPowerToggleItem = NSMenuItem(title: "Pause in Low Power Mode", action: #selector(togglePauseOnLowPower), keyEquivalent: "")
+        lowPowerToggleItem.target = self
+        lowPowerToggleItem.image = NSImage(systemSymbolName: "leaf.fill", accessibilityDescription: nil)
+        lowPowerToggleItem.state = pauseOnLowPower ? .on : .off
+        batteryMenu.addItem(lowPowerToggleItem)
+
+        let batteryParentItem = NSMenuItem(title: "Energy & Battery Saver", action: nil, keyEquivalent: "")
+        batteryParentItem.image = NSImage(systemSymbolName: "bolt.battery", accessibilityDescription: nil)
+        batteryParentItem.submenu = batteryMenu
+        menu.addItem(batteryParentItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -240,7 +367,6 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(speedParentItem)
 
-
         menu.addItem(NSMenuItem.separator())
         let quitItem = NSMenuItem(title: "Stop Wallpaper", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
@@ -250,23 +376,98 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         statusItem?.menu = menu
     }
 
+    @objc func playNextWallpaper() {
+        guard playlist.count > 1 else { return }
+        if isShuffle {
+            var nextIdx = Int.random(in: 0..<playlist.count)
+            if nextIdx == playlistIndex { nextIdx = (nextIdx + 1) % playlist.count }
+            playlistIndex = nextIdx
+        } else {
+            playlistIndex = (playlistIndex + 1) % playlist.count
+        }
+        switchMedia(url: playlist[playlistIndex])
+    }
+
+    @objc func playPreviousWallpaper() {
+        guard playlist.count > 1 else { return }
+        playlistIndex = (playlistIndex - 1 + playlist.count) % playlist.count
+        switchMedia(url: playlist[playlistIndex])
+    }
+
+    @objc func toggleShuffle() {
+        isShuffle.toggle()
+        setupStatusBarItem()
+    }
+
+    @objc func selectRotationInterval(_ sender: NSMenuItem) {
+        guard let secondsNum = sender.representedObject as? NSNumber else { return }
+        rotationInterval = secondsNum.doubleValue
+        restartRotationTimer()
+        setupStatusBarItem()
+    }
+
+    func restartRotationTimer() {
+        rotationTimer?.invalidate()
+        rotationTimer = nil
+        guard rotationInterval > 0, playlist.count > 1 else { return }
+        rotationTimer = Timer.scheduledTimer(withTimeInterval: rotationInterval, repeats: true) { [weak self] _ in
+            self?.playNextWallpaper()
+        }
+    }
+
+    @objc func togglePauseOnBattery() {
+        pauseOnBattery.toggle()
+        evaluatePlaybackState()
+        setupStatusBarItem()
+    }
+
+    @objc func togglePauseOnLowPower() {
+        pauseOnLowPower.toggle()
+        evaluatePlaybackState()
+        setupStatusBarItem()
+    }
+
+    @objc func powerStateDidChange() {
+        evaluatePlaybackState()
+    }
+
     @objc func openWallpaperFilePicker() {
         NSApp.activate(ignoringOtherApps: true)
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
-        panel.canChooseDirectories = false
+        panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.movie, .quickTimeMovie, .mpeg4Movie, .gif]
-        panel.title = "Choose Desktop Wallpaper"
+        panel.title = "Choose Desktop Wallpaper or Folder"
         panel.prompt = "Set Wallpaper"
         if panel.runModal() == .OK, let selectedURL = panel.url {
-            switchMedia(url: selectedURL)
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: selectedURL.path, isDirectory: &isDir), isDir.boolValue {
+                let items = scanMediaFolder(dirURL: selectedURL)
+                if !items.isEmpty {
+                    self.playlist = items
+                    self.playlistIndex = 0
+                    if self.rotationInterval == 0 {
+                        self.rotationInterval = 900 // default 15m for newly selected folder
+                    }
+                    restartRotationTimer()
+                    switchMedia(url: items[0])
+                }
+            } else {
+                self.playlist = [selectedURL]
+                self.playlistIndex = 0
+                restartRotationTimer()
+                switchMedia(url: selectedURL)
+            }
         }
     }
 
     @objc func selectRecentWallpaper(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String else { return }
         let selectedURL = URL(fileURLWithPath: path)
+        self.playlist = [selectedURL]
+        self.playlistIndex = 0
+        restartRotationTimer()
         switchMedia(url: selectedURL)
     }
 
@@ -368,7 +569,6 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-
     @objc func quitApp() {
         NSApp.terminate(nil)
     }
@@ -397,10 +597,26 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func evaluatePlaybackState() {
-        if userManuallyPaused || isScreenLocked || isDisplayAsleep {
+        let onBattery = isRunningOnBattery()
+        let inLowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        let batteryBlock = pauseOnBattery && onBattery
+        let lowPowerBlock = pauseOnLowPower && inLowPower
+
+        if userManuallyPaused || isScreenLocked || isDisplayAsleep || batteryBlock || lowPowerBlock {
             pauseAllPlayers()
+            if batteryBlock {
+                playPauseMenuItem?.title = "Paused (On Battery)"
+                playPauseMenuItem?.image = NSImage(systemSymbolName: "battery.50", accessibilityDescription: nil)
+            } else if lowPowerBlock {
+                playPauseMenuItem?.title = "Paused (Low Power Mode)"
+                playPauseMenuItem?.image = NSImage(systemSymbolName: "leaf.fill", accessibilityDescription: nil)
+            } else {
+                playPauseMenuItem?.title = "Resume Wallpaper"
+                playPauseMenuItem?.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: nil)
+            }
             return
         }
+
         let isAnyVisible = windows.isEmpty ? true : windows.contains { w in w.occlusionState.contains(.visible) }
         if isAnyVisible {
             resumeAllPlayers()
@@ -552,7 +768,11 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
             window.orderFrontRegardless()
 
             if !userManuallyPaused && !isScreenLocked && !isDisplayAsleep {
-                queuePlayer.playImmediately(atRate: currentSpeed)
+                let onBattery = isRunningOnBattery()
+                let inLowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+                if !(pauseOnBattery && onBattery) && !(pauseOnLowPower && inLowPower) {
+                    queuePlayer.playImmediately(atRate: currentSpeed)
+                }
             }
 
             players.append(queuePlayer)
@@ -562,30 +782,127 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
 }
 
 let args = CommandLine.arguments
-guard args.count >= 2 else {
-    fputs("Usage: desktop_video_player <media_path> [--fit] [--speed <float>]\n", stderr)
-    exit(1)
-}
+var targetPath: String? = nil
+var fitScreen = false
+var speedVal: Float = 1.0
+var pauseBattery = false
+var pauseLowPower = true
+var rotateInterval: TimeInterval = 0
+var shuffleActive = false
+var playlistItems: [URL] = []
+var openPickerAtLaunch = false
 
-let mediaPath = args[1]
-let fillScreen = !args.contains("--fit")
-var speed: Float = 1.0
-if let speedIdx = args.firstIndex(of: "--speed"), speedIdx + 1 < args.count {
-    if let s = Float(args[speedIdx + 1]), s > 0 {
-        speed = s
+var idx = 1
+while idx < args.count {
+    let arg = args[idx]
+    if arg == "--fit" {
+        fitScreen = true
+    } else if arg == "--speed", idx + 1 < args.count {
+        if let s = Float(args[idx + 1]), s > 0 { speedVal = s }
+        idx += 1
+    } else if arg == "--pause-on-battery" {
+        pauseBattery = true
+    } else if arg == "--no-pause-on-low-power" {
+        pauseLowPower = false
+    } else if arg == "--interval", idx + 1 < args.count {
+        if let sec = Double(args[idx + 1]), sec >= 0 { rotateInterval = sec }
+        idx += 1
+    } else if arg == "--shuffle" {
+        shuffleActive = true
+    } else if arg == "--playlist", idx + 1 < args.count {
+        let pFile = URL(fileURLWithPath: args[idx + 1])
+        if let data = try? Data(contentsOf: pFile),
+           let paths = try? JSONDecoder().decode([String].self, from: data) {
+            playlistItems = paths.map { URL(fileURLWithPath: $0) }.filter { FileManager.default.fileExists(atPath: $0.path) }
+        }
+        idx += 1
+    } else if arg == "--open-picker" {
+        openPickerAtLaunch = true
+    } else if !arg.starts(with: "--") && targetPath == nil {
+        targetPath = arg
     }
-}
-
-let url = URL(fileURLWithPath: mediaPath)
-guard FileManager.default.fileExists(atPath: url.path) else {
-    fputs("Error: File not found at \(mediaPath)\n", stderr)
-    exit(1)
+    idx += 1
 }
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-let delegate = WallpaperAppDelegate(mediaURL: url, fillScreen: fillScreen, speed: speed)
+
+var resolvedURL: URL? = nil
+if let path = targetPath {
+    let u = URL(fileURLWithPath: path)
+    var isDir: ObjCBool = false
+    if FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir) {
+        if isDir.boolValue {
+            let files = scanMediaFolder(dirURL: u)
+            if !files.isEmpty {
+                playlistItems = files
+                resolvedURL = files[0]
+                if rotateInterval == 0 {
+                    rotateInterval = 900 // default 15m for folder
+                }
+            }
+        } else {
+            resolvedURL = u
+        }
+    }
+}
+
+if resolvedURL == nil && !playlistItems.isEmpty {
+    resolvedURL = playlistItems[0]
+}
+
+// Fallback to recent wallpaper if none specified
+if resolvedURL == nil {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    let recURL = home.appendingPathComponent(".macground_recents.json")
+    if let data = try? Data(contentsOf: recURL),
+       let list = try? JSONDecoder().decode([String].self, from: data) {
+        for p in list {
+            if FileManager.default.fileExists(atPath: p) {
+                resolvedURL = URL(fileURLWithPath: p)
+                break
+            }
+        }
+    }
+}
+
+guard let activeURL = resolvedURL else {
+    // If still no wallpaper found, launch the picker directly
+    let dummyURL = URL(fileURLWithPath: "/tmp/dummy.mp4")
+    let delegate = WallpaperAppDelegate(
+        mediaURL: dummyURL,
+        fillScreen: !fitScreen,
+        speed: speedVal,
+        pauseOnBattery: pauseBattery,
+        pauseOnLowPower: pauseLowPower,
+        playlist: [],
+        interval: rotateInterval,
+        shuffle: shuffleActive
+    )
+    app.delegate = delegate
+    DispatchQueue.main.async {
+        delegate.openWallpaperFilePicker()
+    }
+    app.run()
+    exit(0)
+}
+
+let delegate = WallpaperAppDelegate(
+    mediaURL: activeURL,
+    fillScreen: !fitScreen,
+    speed: speedVal,
+    pauseOnBattery: pauseBattery,
+    pauseOnLowPower: pauseLowPower,
+    playlist: playlistItems,
+    interval: rotateInterval,
+    shuffle: shuffleActive
+)
 app.delegate = delegate
+if openPickerAtLaunch {
+    DispatchQueue.main.async {
+        delegate.openWallpaperFilePicker()
+    }
+}
 app.run()
 """
 
@@ -599,19 +916,21 @@ import CoreGraphics
 
 let args = CommandLine.arguments
 guard args.count >= 3 else {
-    fputs("Usage: media_to_mov <input_file> <output.mov>\n", stderr)
+    fputs("Usage: media_to_mov <input_file> <output.mov> [--ping-pong] [--crossfade <frames>]\n", stderr)
     exit(1)
 }
 
 let inputURL = URL(fileURLWithPath: args[1])
 let outputURL = URL(fileURLWithPath: args[2])
+let isPingPong = args.contains("--ping-pong")
+var crossfadeFrames = 0
+if let cfIdx = args.firstIndex(of: "--crossfade"), cfIdx + 1 < args.count {
+    if let f = Int(args[cfIdx + 1]), f > 0 { crossfadeFrames = f }
+}
 let ext = inputURL.pathExtension.lowercased()
 
 try? FileManager.default.removeItem(at: outputURL)
 
-/// Shared pixel-buffer builder used by both `convertGIFToMOV` and `convertVideoTo4KMOV`:
-/// draws a `CGImage` into a clean `32ARGB` `DeviceRGB` buffer from `adaptor.pixelBufferPool`
-/// with zero source `CVBuffer` attachments so `WallpaperAerialsExtension` decodes cleanly.
 func makePixelBuffer(from image: CGImage, pool: CVPixelBufferPool?, width: Int, height: Int) -> CVPixelBuffer? {
     var pixelBuffer: CVPixelBuffer?
     if let pool = pool {
@@ -660,7 +979,6 @@ func makeMOVWriter(outputURL: URL, width: Int, height: Int) -> (AVAssetWriter, A
         kCVPixelBufferHeightKey as String: height
     ]
 
-    // High quality 4K 60 FPS bitrate configuration (~50 Mbps target)
     let compressionProps: [String: Any] = [
         AVVideoAverageBitRateKey: 50_000_000,
         AVVideoExpectedSourceFrameRateKey: 60
@@ -690,7 +1008,6 @@ func makeMOVWriter(outputURL: URL, width: Int, height: Int) -> (AVAssetWriter, A
         }
     }
 
-    // Fallback without explicit compression properties if hardware encoder requires defaults
     for codec in candidateCodecs {
         try? FileManager.default.removeItem(at: outputURL)
         guard let w = try? AVAssetWriter(outputURL: outputURL, fileType: .mov) else { continue }
@@ -716,9 +1033,7 @@ func makeMOVWriter(outputURL: URL, width: Int, height: Int) -> (AVAssetWriter, A
     return nil
 }
 
-/// Encodes `.mp4` / `.mov` / `.m4v` at native 4K resolution (up to 3840x2160) using the
-/// exact same `CGImage` -> `makePixelBuffer` -> `AVAssetWriter` pipeline as `convertGIFToMOV`.
-func convertVideoTo4KMOV(videoURL: URL, outputURL: URL) -> Bool {
+func convertVideoTo4KMOV(videoURL: URL, outputURL: URL, pingPong: Bool, crossfade: Int) -> Bool {
     let asset = AVURLAsset(url: videoURL)
     guard let videoTrack = asset.tracks(withMediaType: .video).first else {
         fputs("Error: No video track found in \(videoURL.path)\n", stderr)
@@ -744,7 +1059,6 @@ func convertVideoTo4KMOV(videoURL: URL, outputURL: URL) -> Bool {
         return false
     }
 
-    // Silky-smooth 60 FPS lock screen pipeline (600 timescale, 10 ticks per frame)
     let srcFPS = Double(videoTrack.nominalFrameRate > 0 ? videoTrack.nominalFrameRate : 30.0)
     let targetFPS = 60.0
     let timescale: Int32 = 600
@@ -754,12 +1068,15 @@ func convertVideoTo4KMOV(videoURL: URL, outputURL: URL) -> Bool {
 
     let durationSec = max(0.1, CMTimeGetSeconds(asset.duration))
     let repeatCount = max(1, Int(ceil(6.0 / min(durationSec, 7.2))))
-    let maxTotalFrames = 360 // 6.0 seconds of native 60 FPS 4K animation
+    let maxTotalFrames = pingPong ? 480 : 360
 
     var currentTime = CMTime.zero
     var totalWritten = 0
     var lastBuffer: CVPixelBuffer?
     let colorSpace = CGColorSpaceCreateDeviceRGB()
+
+    // Store frame buffers if pingPong is active (capped to avoid memory bloat)
+    var frameCache: [CVPixelBuffer] = []
 
     for _ in 0..<repeatCount {
         if totalWritten >= maxTotalFrames { break }
@@ -790,6 +1107,10 @@ func convertVideoTo4KMOV(videoURL: URL, outputURL: URL) -> Bool {
                 lastBuffer = pb
                 CVBufferRemoveAllAttachments(pb)
 
+                if pingPong && frameCache.count < 180 {
+                    frameCache.append(pb)
+                }
+
                 for _ in 0..<dupPerFrame {
                     if totalWritten >= maxTotalFrames { break }
                     while !writerInput.isReadyForMoreMediaData {
@@ -798,29 +1119,6 @@ func convertVideoTo4KMOV(videoURL: URL, outputURL: URL) -> Bool {
                     if adaptor.append(pb, withPresentationTime: currentTime) {
                         currentTime = CMTimeAdd(currentTime, step)
                         totalWritten += 1
-                    } else {
-                        // Direct buffer append fallback via makePixelBuffer if adaptor rejected raw buffer
-                        CVPixelBufferLockBaseAddress(pb, .readOnly)
-                        let fallbackImg: CGImage? = {
-                            guard let ctx = CGContext(
-                                data: CVPixelBufferGetBaseAddress(pb),
-                                width: targetW,
-                                height: targetH,
-                                bitsPerComponent: 8,
-                                bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
-                                space: colorSpace,
-                                bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
-                            ) else { return nil }
-                            return ctx.makeImage()
-                        }()
-                        CVPixelBufferUnlockBaseAddress(pb, .readOnly)
-
-                        if let validImg = fallbackImg,
-                           let cleanBuf = makePixelBuffer(from: validImg, pool: adaptor.pixelBufferPool, width: targetW, height: targetH) {
-                            adaptor.append(cleanBuf, withPresentationTime: currentTime)
-                            currentTime = CMTimeAdd(currentTime, step)
-                            totalWritten += 1
-                        }
                     }
                 }
             }
@@ -828,6 +1126,20 @@ func convertVideoTo4KMOV(videoURL: URL, outputURL: URL) -> Bool {
             if totalWritten >= maxTotalFrames {
                 reader.cancelReading()
                 break
+            }
+        }
+
+        // Append reversed frames for ping-pong bounce loop
+        if pingPong && !frameCache.isEmpty {
+            for pb in frameCache.reversed() {
+                if totalWritten >= maxTotalFrames { break }
+                while !writerInput.isReadyForMoreMediaData {
+                    Thread.sleep(forTimeInterval: 0.001)
+                }
+                if adaptor.append(pb, withPresentationTime: currentTime) {
+                    currentTime = CMTimeAdd(currentTime, step)
+                    totalWritten += 1
+                }
             }
         }
     }
@@ -855,8 +1167,7 @@ func convertVideoTo4KMOV(videoURL: URL, outputURL: URL) -> Bool {
     return writer.status == .completed
 }
 
-/// Encodes `.gif` files to `.mov` using the exact same `makePixelBuffer` -> `AVAssetWriter` pipeline.
-func convertGIFToMOV(gifURL: URL, outputURL: URL) -> Bool {
+func convertGIFToMOV(gifURL: URL, outputURL: URL, pingPong: Bool) -> Bool {
     guard let source = CGImageSourceCreateWithURL(gifURL as CFURL, nil) else {
         fputs("Error: Could not read GIF source at \(gifURL.path)\n", stderr)
         return false
@@ -914,6 +1225,21 @@ func convertGIFToMOV(gifURL: URL, outputURL: URL) -> Bool {
             let step = CMTime(seconds: delay, preferredTimescale: timescale)
             currentTime = CMTimeAdd(currentTime, step)
         }
+
+        if pingPong && frameCount > 2 {
+            for i in stride(from: frameCount - 2, through: 1, by: -1) {
+                guard let cgImage = CGImageSourceCreateImageAtIndex(source, i, nil) else { continue }
+                while !writerInput.isReadyForMoreMediaData {
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+                if let buffer = makePixelBuffer(from: cgImage, pool: adaptor.pixelBufferPool, width: width, height: height) {
+                    adaptor.append(buffer, withPresentationTime: currentTime)
+                }
+                let delay = frameDuration(at: i, source: source)
+                let step = CMTime(seconds: delay, preferredTimescale: timescale)
+                currentTime = CMTimeAdd(currentTime, step)
+            }
+        }
     }
 
     if let lastImage = CGImageSourceCreateImageAtIndex(source, frameCount - 1, nil) {
@@ -936,13 +1262,13 @@ func convertGIFToMOV(gifURL: URL, outputURL: URL) -> Bool {
 }
 
 if ext == "gif" {
-    if convertGIFToMOV(gifURL: inputURL, outputURL: outputURL) {
+    if convertGIFToMOV(gifURL: inputURL, outputURL: outputURL, pingPong: isPingPong) {
         exit(0)
     }
     exit(1)
 } else {
     fputs("[*] Encoding '\(inputURL.lastPathComponent)' at native 4K resolution (up to 3840x2160) for Lock Screen...\n", stderr)
-    if convertVideoTo4KMOV(videoURL: inputURL, outputURL: outputURL) {
+    if convertVideoTo4KMOV(videoURL: inputURL, outputURL: outputURL, pingPong: isPingPong, crossfade: crossfadeFrames) {
         exit(0)
     }
     exit(1)
@@ -1014,7 +1340,7 @@ def ensure_compiled_binary() -> Path:
     return compile_swift_helper(
         "desktop_video_player",
         SWIFT_DESKTOP_PLAYER_SOURCE,
-        ["Cocoa", "AVFoundation", "UniformTypeIdentifiers"],
+        ["Cocoa", "AVFoundation", "UniformTypeIdentifiers", "IOKit"],
     )
 
 
@@ -1027,12 +1353,141 @@ def ensure_media_converter_binary() -> Path:
     )
 
 
+def parse_interval_string(val: str) -> float:
+    """Parses a time interval like '30s', '5m', '15m', '1h' or raw seconds into float seconds."""
+    v = val.strip().lower()
+    if v.endswith("s"):
+        return float(v[:-1])
+    if v.endswith("m"):
+        return float(v[:-1]) * 60.0
+    if v.endswith("h"):
+        return float(v[:-1]) * 3600.0
+    return float(v)
+
+
+def scan_media_paths(target: Path) -> list[Path]:
+    """Scans a file or directory for valid video and GIF media."""
+    valid_exts = {".mp4", ".mov", ".m4v", ".gif"}
+    if target.is_file():
+        if target.suffix.lower() in valid_exts:
+            return [target.resolve()]
+        return []
+    if target.is_dir():
+        found = []
+        for p in sorted(target.iterdir()):
+            if not p.name.startswith(".") and p.suffix.lower() in valid_exts:
+                found.append(p.resolve())
+        return found
+    return []
+
+
+def build_app_icon_icns(output_path: Path):
+    """Generates a native Apple ICNS icon with a modern rounded-rect dark gradient & SF Symbol."""
+    swift_icon_gen = """
+import Cocoa
+
+let img = NSImage(size: NSSize(width: 512, height: 512))
+img.lockFocus()
+let rect = NSRect(x: 0, y: 0, width: 512, height: 512)
+let path = NSBezierPath(roundedRect: rect, xRadius: 110, yRadius: 110)
+
+let gradient = NSGradient(colors: [
+    NSColor(calibratedRed: 0.10, green: 0.12, blue: 0.20, alpha: 1.0),
+    NSColor(calibratedRed: 0.16, green: 0.28, blue: 0.52, alpha: 1.0)
+])
+gradient?.draw(in: path, angle: 45)
+
+if let symbol = NSImage(systemSymbolName: "play.desktopcomputer", accessibilityDescription: nil) {
+    let symRect = NSRect(x: 106, y: 106, width: 300, height: 300)
+    symbol.draw(in: symRect, from: .zero, operation: .sourceOver, fraction: 1.0)
+}
+img.unlockFocus()
+
+if let tiff = img.tiffRepresentation,
+   let rep = NSBitmapImageRep(data: tiff),
+   let png = rep.representation(using: .png, properties: [:]) {
+    try? png.write(to: URL(fileURLWithPath: "/tmp/macground_app_icon_512.png"))
+}
+"""
+    subprocess.run(["swift", "-e", swift_icon_gen], check=True, capture_output=True)
+    temp_png = Path("/tmp/macground_app_icon_512.png")
+    if temp_png.exists():
+        png_data = temp_png.read_bytes()
+        temp_png.unlink(missing_ok=True)
+        block_len = 8 + len(png_data)
+        block = b"ic09" + struct.pack(">I", block_len) + png_data
+        total_len = 8 + len(block)
+        header = b"icns" + struct.pack(">I", total_len)
+        output_path.write_bytes(header + block)
+
+
+def build_macos_app_bundle(output_dir: Path | None = None) -> Path:
+    """
+    Packages Macground into a standalone, double-clickable macOS application bundle (.app).
+    Features LSUIElement=true so it runs cleanly in the macOS menu bar without cluttering the Dock.
+    """
+    dest_dir = output_dir or Path(__file__).resolve().parent
+    app_path = dest_dir / "Macground.app"
+    contents_dir = app_path / "Contents"
+    macos_dir = contents_dir / "MacOS"
+    resources_dir = contents_dir / "Resources"
+
+    if app_path.exists():
+        shutil.rmtree(app_path)
+
+    macos_dir.mkdir(parents=True, exist_ok=True)
+    resources_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Compile native helpers
+    desktop_bin = ensure_compiled_binary()
+    converter_bin = ensure_media_converter_binary()
+
+    shutil.copy2(desktop_bin, resources_dir / "desktop_video_player")
+    shutil.copy2(converter_bin, resources_dir / "media_to_mov")
+    shutil.copy2(Path(__file__).resolve(), resources_dir / "Macground.py")
+
+    # 2. Generate native icon
+    icon_path = resources_dir / "AppIcon.icns"
+    build_app_icon_icns(icon_path)
+
+    # 3. Create Info.plist
+    info_plist = {
+        "CFBundleName": "Macground",
+        "CFBundleDisplayName": "Macground",
+        "CFBundleIdentifier": "com.macground.app",
+        "CFBundleVersion": "2.0.0",
+        "CFBundleShortVersionString": "2.0.0",
+        "CFBundlePackageType": "APPL",
+        "CFBundleExecutable": "Macground",
+        "CFBundleIconFile": "AppIcon",
+        "LSMinimumSystemVersion": "12.0",
+        "LSUIElement": True,
+        "NSHighResolutionCapable": True,
+        "NSPrincipalClass": "NSApplication",
+    }
+    with (contents_dir / "Info.plist").open("wb") as f:
+        plistlib.dump(info_plist, f)
+
+    (contents_dir / "PkgInfo").write_bytes(b"APPL????")
+
+    # 4. Create executable launcher script
+    launcher_path = macos_dir / "Macground"
+    launcher_script = f"""#!/bin/sh
+DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+exec /usr/bin/python3 "$DIR/Macground.py" "$@" --open-picker-if-empty
+"""
+    launcher_path.write_text(launcher_script, encoding="utf-8")
+    os.chmod(launcher_path, 0o755)
+
+    print(f"[+] Created standalone macOS app: {app_path}")
+    return app_path
+
+
 def install_root_watchpaths_daemon():
     """
     Installs a root `WatchPaths` LaunchDaemon (`/Library/LaunchDaemons/com.macground.lockreset.plist`)
-    that watches `/tmp/.macground_unlock_trigger` (touched by `desktop_video_player` in the user's
-    Aqua session whenever `com.apple.screenIsUnlocked` fires) and kills `idleassetsd` and
-    `WallpaperAerialsExtension` as `root` on every unlock!
+    that watches `/tmp/.macground_unlock_trigger` and resets Lock Screen video daemons as root on unlock.
     """
     if os.geteuid() != 0:
         return
@@ -1073,10 +1528,9 @@ def install_root_watchpaths_daemon():
         print(f"[!] Warning: Could not install Lock Screen Reset Daemon ({exc})")
 
 
-def prepare_lockscreen_mov(media_path: Path) -> Path:
+def prepare_lockscreen_mov(media_path: Path, ping_pong: bool = False, crossfade: int = 0) -> Path:
     """
-    Packages `media_path` (whether `.gif`, `.mp4`, `.m4v`, or `.mov`) into a Lock Screen
-    `.mov` at native 4K resolution (up to 3840x2160) using the clean 32ARGB DeviceRGB pipeline.
+    Packages `media_path` into a Lock Screen `.mov` at native 4K resolution (up to 3840x2160).
     """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     sudo_uid = os.environ.get("SUDO_UID")
@@ -1088,8 +1542,9 @@ def prepare_lockscreen_mov(media_path: Path) -> Path:
             pass
 
     stat = media_path.stat()
+    tag = f"pp_{ping_pong}_cf_{crossfade}"
     fingerprint = hashlib.sha256(
-        f"{media_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:via_4k_60fps_v8_directgpu".encode("utf-8")
+        f"{media_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:{tag}:via_4k_60fps_v9".encode("utf-8")
     ).hexdigest()[:12]
     converted_mov = CACHE_DIR / f"{media_path.stem}_{fingerprint}.mov"
 
@@ -1110,6 +1565,10 @@ def prepare_lockscreen_mov(media_path: Path) -> Path:
         str(media_path.resolve()),
         str(converted_mov),
     ])
+    if ping_pong:
+        cmd.append("--ping-pong")
+    if crossfade > 0:
+        cmd.extend(["--crossfade", str(crossfade)])
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.stderr:
@@ -1129,22 +1588,44 @@ def stop_existing_desktop_player():
     subprocess.run(["pkill", "-f", "desktop_video_player"], stderr=subprocess.DEVNULL)
 
 
-def run_desktop_mode(video_path: Path, fit: bool, foreground: bool, speed: float = 1.0):
+def run_desktop_mode(
+    video_path: Path,
+    fit: bool = False,
+    foreground: bool = False,
+    speed: float = 1.0,
+    pause_on_battery: bool = False,
+    pause_on_low_power: bool = True,
+    interval: float = 0.0,
+    shuffle: bool = False,
+    ping_pong: bool = False,
+):
     """Launches the desktop video/GIF wallpaper behind desktop icons."""
     binary_path = ensure_compiled_binary()
     stop_existing_desktop_player()
+
+    target_media = video_path
+    if ping_pong and video_path.is_file():
+        target_media = prepare_lockscreen_mov(video_path, ping_pong=True)
 
     sudo_user = os.environ.get("SUDO_USER")
     cmd = []
     if os.geteuid() == 0 and sudo_user and sudo_user != "root":
         cmd.extend(["sudo", "-u", sudo_user])
 
-    cmd.extend([str(binary_path), str(video_path.resolve())])
+    cmd.extend([str(binary_path), str(target_media.resolve())])
     cmd.extend(["--script-path", str(Path(__file__).resolve())])
     if fit:
         cmd.append("--fit")
     if speed != 1.0:
         cmd.extend(["--speed", str(speed)])
+    if pause_on_battery:
+        cmd.append("--pause-on-battery")
+    if not pause_on_low_power:
+        cmd.append("--no-pause-on-low-power")
+    if interval > 0:
+        cmd.extend(["--interval", str(interval)])
+    if shuffle:
+        cmd.append("--shuffle")
 
     if foreground:
         print(f"[*] Playing '{video_path.name}' on Desktop background (Ctrl+C to stop)...")
@@ -1175,6 +1656,10 @@ def configure_startup_launch_agent(
     video_path: Path | None,
     fit: bool = False,
     speed: float = 1.0,
+    pause_on_battery: bool = False,
+    pause_on_low_power: bool = True,
+    interval: float = 0.0,
+    shuffle: bool = False,
     enable: bool = True,
 ):
     """
@@ -1217,6 +1702,14 @@ def configure_startup_launch_agent(
         prog_args.append("--fit")
     if speed != 1.0:
         prog_args.extend(["--speed", str(speed)])
+    if pause_on_battery:
+        prog_args.append("--pause-on-battery")
+    if not pause_on_low_power:
+        prog_args.append("--no-pause-on-low-power")
+    if interval > 0:
+        prog_args.extend(["--interval", str(interval)])
+    if shuffle:
+        prog_args.append("--shuffle")
 
     plist_data = {
         "Label": "com.macground.desktop",
@@ -1267,10 +1760,7 @@ def list_downloaded_aerials() -> list[tuple[str, Path]]:
 
 
 def build_aerial_wallpaper_choice_node(asset_id: str) -> dict:
-    """
-    Constructs the `Index.plist` dictionary structure that instructs macOS's
-    `WallpaperAgent`, `WallpaperAerialsExtension`, and `idleassetsd` to play `asset_id`.
-    """
+    """Constructs the Index.plist dictionary structure for Apple's Aerial wallpaper engine."""
     config_plist = plistlib.dumps({"assetID": asset_id}, fmt=plistlib.FMT_BINARY)
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     return {
@@ -1291,11 +1781,7 @@ def build_aerial_wallpaper_choice_node(asset_id: str) -> dict:
 
 
 def activate_aerial_in_user_index_plist(asset_id: str) -> list[str]:
-    """
-    Updates `~/Library/Application Support/com.apple.wallpaper/Store/Index.plist`
-    to switch away from the hardcoded Golden Gate Sunset ID (`4207734D-74FE-4F92-B5E1-6EC8DEE24A15`)
-    and use `asset_id` (`4C108785-A7BA-422E-9C79-B0129F1D5550` - Tahoe Day) instead.
-    """
+    """Updates ~/Library/Application Support/com.apple.wallpaper/Store/Index.plist."""
     user_home = get_target_user_home()
     store_dir = user_home / "Library" / "Application Support" / "com.apple.wallpaper" / "Store"
     index_plist = store_dir / "Index.plist"
@@ -1385,10 +1871,7 @@ def activate_aerial_in_user_index_plist(asset_id: str) -> list[str]:
 
 
 def mark_aerials_downloaded_in_sqlite(asset_ids: list[str]):
-    """
-    Marks all target `asset_ids` as downloaded (`ZLASTDOWNLOADED`) AND clears `ZPOINTSOFINTEREST`
-    in `/Library/Application Support/com.apple.idleassetsd/Aerial.sqlite`.
-    """
+    """Marks target asset_ids downloaded in Aerial.sqlite."""
     if not AERIAL_SQLITE.exists():
         return
     try:
@@ -1407,11 +1890,7 @@ def mark_aerials_downloaded_in_sqlite(asset_ids: list[str]):
 
 
 def install_mov_to_destination(src_mov: Path, dst_mov: Path, uid: int = 0, gid: int = 80, is_first: bool = False):
-    """
-    Installs `src_mov` to `dst_mov`, backing up any original file and stripping quarantine xattrs.
-    Uses hardlinks (`os.link`) after the first copy on the same volume so populating 40+ Aerial slots
-    takes 0 extra disk space and completes instantaneously!
-    """
+    """Installs src_mov to dst_mov via hardlinks after initial placement."""
     dst_mov.parent.mkdir(parents=True, exist_ok=True)
     if dst_mov.exists():
         backup_file = dst_mov.with_suffix(".mov.bak")
@@ -1438,12 +1917,9 @@ def install_mov_to_destination(src_mov: Path, dst_mov: Path, uid: int = 0, gid: 
     subprocess.run(["xattr", "-c", str(dst_mov)], stderr=subprocess.DEVNULL)
 
 
-def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
-    """
-    Encodes any video or GIF into a native 4K Lock Screen `.mov`, installs it across all
-    Lock Screen directories, and configures the user + root unlock reset trigger.
-    """
-    playable_mov = prepare_lockscreen_mov(video_path)
+def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None, ping_pong: bool = False, crossfade: int = 0):
+    """Encodes any video or GIF into a native 4K Lock Screen .mov and installs it."""
+    playable_mov = prepare_lockscreen_mov(video_path, ping_pong=ping_pong, crossfade=crossfade)
 
     if target_id:
         clean_target = target_id[:-4] if target_id.endswith(".mov") else target_id
@@ -1455,7 +1931,6 @@ def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
         primary_id = PRIMARY_DEFAULT_ID
 
     if os.geteuid() != 0:
-        # 1. Update user-owned Index.plist immediately
         discovered_ids = activate_aerial_in_user_index_plist(primary_id)
         target_ids = []
         for aid in [primary_id] + BUILTIN_SLOTS_TO_POPULATE + discovered_ids:
@@ -1482,14 +1957,12 @@ def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
             except Exception:
                 pass
 
-        # 2. Touch /tmp/.macground_lockscreen_request for root LaunchDaemon to sync system slots
         try:
             LOCKSCREEN_REQUEST_FILE.write_text(str(video_path.resolve()), encoding="utf-8")
             os.chmod(LOCKSCREEN_REQUEST_FILE, 0o666)
         except Exception:
             pass
 
-        # 3. Restart user wallpaper extensions
         for daemon in ["WallpaperAerialsExtension", "WallpaperVideoExtension", "WallpaperAgent", "NeptuneOneWallpaper"]:
             subprocess.run(["killall", "-9", daemon], stderr=subprocess.DEVNULL)
 
@@ -1498,6 +1971,8 @@ def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
             cmd = ["sudo", sys.executable, str(Path(__file__).resolve()), str(playable_mov), "--mode", "lockscreen"]
             if target_id:
                 cmd.extend(["--target-id", target_id])
+            if ping_pong:
+                cmd.append("--ping-pong")
             res = subprocess.run(cmd)
             sys.exit(res.returncode)
         else:
@@ -1620,7 +2095,7 @@ def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
 
 
 def restore_lockscreen_aerials():
-    """Restores any backed up `.mov.bak` Aerial videos and `Index.plist.bak`."""
+    """Restores any backed up .mov.bak Aerial videos and Index.plist.bak."""
     if os.geteuid() != 0:
         subprocess.run(["sudo", sys.executable, str(Path(__file__).resolve()), "--restore-lockscreen"])
         return
@@ -1707,12 +2182,12 @@ def restore_lockscreen_aerials():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Play a custom video (.mp4, .mov, .m4v) or animated GIF (.gif) on the macOS Desktop background and Lock Screen."
+        description="Macground: High-performance 4K video & animated GIF wallpapers for macOS Desktop & Lock Screen."
     )
     parser.add_argument(
         "video",
         nargs="?",
-        help="Path to the video or animated GIF file (.mp4, .mov, .m4v, .gif)",
+        help="Path to a video file, animated GIF, or a folder of wallpapers.",
     )
     parser.add_argument(
         "--mode",
@@ -1742,7 +2217,47 @@ def main():
         "--speed",
         type=float,
         default=1.0,
-        help="Playback speed multiplier for video wallpaper (e.g. 0.5 for half speed, 0.75 for cinematic slow-mo).",
+        help="Playback speed multiplier (e.g. 0.5 for half speed, 0.75 for cinematic slow-mo).",
+    )
+    parser.add_argument(
+        "--pause-on-battery",
+        action="store_true",
+        help="Automatically pause video playback when running on MacBook battery power.",
+    )
+    parser.add_argument(
+        "--no-pause-on-low-power",
+        action="store_true",
+        help="Do not pause video playback when macOS Low Power Mode is enabled (paused by default).",
+    )
+    parser.add_argument(
+        "--interval",
+        help="Auto-rotation interval when providing a folder or playlist (e.g. '1m', '5m', '15m', '30m', '1h', or seconds).",
+    )
+    parser.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="Randomize wallpaper rotation order.",
+    )
+    parser.add_argument(
+        "--ping-pong",
+        action="store_true",
+        help="Create a seamless bounce loop (play forward, then reverse back to start).",
+    )
+    parser.add_argument(
+        "--crossfade",
+        type=int,
+        default=0,
+        help="Number of frames to crossfade at the loop boundary for seamless looping.",
+    )
+    parser.add_argument(
+        "--build-app",
+        action="store_true",
+        help="Package Macground into a standalone, native macOS .app bundle.",
+    )
+    parser.add_argument(
+        "--install-app",
+        action="store_true",
+        help="Build and install Macground.app into /Applications.",
     )
     parser.add_argument(
         "--startup",
@@ -1772,6 +2287,12 @@ def main():
 
     args = parser.parse_args()
 
+    if args.build_app or args.install_app:
+        dest = Path("/Applications") if args.install_app else None
+        app_path = build_macos_app_bundle(output_dir=dest)
+        print(f"[+] Successfully built native macOS bundle: {app_path}")
+        return
+
     if args.no_startup:
         configure_startup_launch_agent(None, enable=False)
         if not args.video:
@@ -1796,23 +2317,64 @@ def main():
                 print(f"  - {label}: {path.name} ({path})")
         return
 
+    interval_sec = 0.0
+    if args.interval:
+        try:
+            interval_sec = parse_interval_string(args.interval)
+        except Exception:
+            print(f"[!] Warning: Invalid interval '{args.interval}', using manual rotation.")
+
     if not args.video:
         parser.print_help()
         sys.exit(1)
 
-    video_path = Path(args.video).expanduser().resolve()
-    if not video_path.exists():
-        print(f"[!] Error: Media file not found: {video_path}", file=sys.stderr)
+    target_path = Path(args.video).expanduser().resolve()
+    if not target_path.exists():
+        print(f"[!] Error: Path not found: {target_path}", file=sys.stderr)
         sys.exit(1)
 
+    items = scan_media_paths(target_path)
+    if not items:
+        print(f"[!] Error: No supported media files (.mp4, .mov, .m4v, .gif) found in {target_path}", file=sys.stderr)
+        sys.exit(1)
+
+    first_video = items[0]
+    if args.shuffle:
+        random.shuffle(items)
+        first_video = items[0]
+
     if args.startup:
-        configure_startup_launch_agent(video_path, fit=args.fit, speed=args.speed, enable=True)
+        configure_startup_launch_agent(
+            target_path,
+            fit=args.fit,
+            speed=args.speed,
+            pause_on_battery=args.pause_on_battery,
+            pause_on_low_power=not args.no_pause_on_low_power,
+            interval=interval_sec,
+            shuffle=args.shuffle,
+            enable=True,
+        )
 
     if args.mode in ("desktop", "both"):
-        run_desktop_mode(video_path, fit=args.fit, foreground=args.foreground, speed=args.speed)
+        run_desktop_mode(
+            target_path,
+            fit=args.fit,
+            foreground=args.foreground,
+            speed=args.speed,
+            pause_on_battery=args.pause_on_battery,
+            pause_on_low_power=not args.no_pause_on_low_power,
+            interval=interval_sec,
+            shuffle=args.shuffle,
+            ping_pong=args.ping_pong,
+        )
 
     if args.mode in ("lockscreen", "both"):
-        apply_lockscreen_aerial(video_path, target_id=args.target_id)
+        apply_lockscreen_aerial(
+            first_video,
+            target_id=args.target_id,
+            ping_pong=args.ping_pong,
+            crossfade=args.crossfade,
+        )
 
 
 if __name__ == "__main__":

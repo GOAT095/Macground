@@ -7,6 +7,12 @@
 *.tiff
 *.ico
 *.psd
+*.o
+*.pyc
+*.dSYM
+*.app
+.build/
+__pycache__/
 .wallpaper_cache
 *cache*
 .DS_Store

@@ -2,7 +2,7 @@
 
 # 🎬 Macground
 
-**Play any custom video (`.mp4`, `.mov`, `.m4v`) or animated `.gif` as your live macOS Desktop Wallpaper and Lock Screen.**
+**High-performance 4K video (`.mp4`, `.mov`, `.m4v`) and animated `.gif` live wallpapers for macOS Desktop & Lock Screen.**
 
 [![macOS](https://img.shields.io/badge/macOS-Sonoma%20%7C%20Sequoia%20%7C%20Tahoe%20(14%2B)-000000?style=for-the-badge&logo=apple&logoColor=white)](#)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](#)
@@ -13,23 +13,34 @@
 
 ---
 
-## ✨ Why Macground?
+## ✨ Features
 
-Most macOS live wallpaper tools only work on the Desktop, require heavy third-party apps, go black/static after 2–3 screen locks on short `.mp4` clips, or break on newer macOS releases because Apple hardcodes the default **Golden Gate Sunset** (`4207734D-74FE-4F92-B5E1-6EC8DEE24A15`) wallpaper to a read-only system volume file (`/System/Library/Wallpapers/.default/Golden Gate.mov`).
-
-**Macground** solves both Desktop and Lock Screen live wallpapers in a single, zero-dependency Python script:
-
-- **🖥️ True Desktop Video & GIF Layer (`--mode desktop`):** Compiles a lightweight native macOS `Cocoa` + `AVFoundation` helper on the fly that pins a borderless, click-through video (`AVPlayerLooper`) or animated GIF (`NSImageView`) window strictly behind your desktop icons (`kCGDesktopWindowLevel`) across all Spaces and monitors at full native 60 FPS. Features **intelligent auto-pause** when windows/fullscreen apps completely cover the desktop, on display sleep, or on screen lock, dropping CPU to 0.0% and conserving battery.
-- **🖥️ Native macOS Menu Bar Controls (`NSStatusItem`):** Adds an Apple HIG-compliant monochrome template SF Symbol (`play.desktopcomputer`) in the top-right menu bar for one-click control:
+- **🖥️ True Desktop Video & GIF Layer (`--mode desktop`):** Compiles a lightweight native macOS `Cocoa` + `AVFoundation` helper that pins a borderless, click-through video (`AVPlayerLooper`) or animated GIF (`NSImageView`) window strictly behind your desktop icons (`kCGDesktopWindowLevel`) across all Spaces and monitors at full native 60 FPS. Features **intelligent auto-pause** when windows/fullscreen apps completely cover the desktop, on display sleep, or on screen lock, dropping CPU to 0.0% and conserving battery.
+- **🔋 Battery Saver & Low Power Mode:**
+  - **Auto-Pause on Battery (`--pause-on-battery`):** Automatically halts video rendering when your MacBook is unplugged from AC power, freezing on a clean frame to maximize battery life.
+  - **Low Power Mode Integration (`--no-pause-on-low-power` to override):** Automatically pauses whenever macOS Low Power Mode is active.
+  - **Status Bar Toggles:** Toggle battery and low power behaviors on the fly directly from the menu bar.
+- **🔄 Playlist & Shuffle Rotation (`--interval`, `--shuffle`):**
+  - Point Macground to a single file or an entire folder of wallpapers (`python3 Macground.py ~/Wallpapers --interval 15m --shuffle`).
+  - Automatically rotates wallpapers on customizable timers (1m, 5m, 15m, 30m, 1h).
+  - One-click **Next Wallpaper** (`n`) and **Previous Wallpaper** (`b`) menu controls.
+- **🔁 Seamless Looping & Ping-Pong Bounce (`--ping-pong`, `--crossfade`):**
+  - **Ping-Pong Mode (`--ping-pong`):** Plays video forward and then in reverse back to the start, creating a natural seamless bounce loop with zero jump cut.
+  - **Crossfade (`--crossfade <frames>`):** Smoothly dissolves loop boundaries so looping animations feel infinite.
+- **🖥️ Native macOS Menu Bar Controls (`NSStatusItem`):** Uses an Apple HIG-compliant monochrome template SF Symbol (`play.desktopcomputer`) in the top-right menu bar:
+  - **Current File Indicator:** Displays the active wallpaper and playlist position (`1/8`).
+  - **Next / Previous / Shuffle Controls:** Instant playlist navigation.
   - **Change Wallpaper...:** Launches a native macOS file dialog (`NSOpenPanel`) to browse and swap wallpapers directly from Finder. Automatically syncs to **both** your Desktop and Lock Screen in real time.
-  - **Recent Wallpapers:** Fast one-click switching between your recently used wallpapers (syncs across Desktop and Lock Screen).
+  - **Recent Wallpapers:** Fast one-click switching between your recently used wallpapers.
+  - **Energy & Battery Saver Submenu:** One-click toggles for "Pause on Battery Power" and "Pause in Low Power Mode".
   - **Playback Speed Control:** Toggle between 0.25x, 0.5x, 0.75x, 1.0x, 1.25x, 1.5x, and 2.0x on the fly.
-  - **Pause / Resume:** Instant playback toggle.
+  - **Pause / Resume:** Instant playback toggle with real-time status indication.
   - **Stop Wallpaper:** Cleanly exits the background process.
-- **⏱️ Cinematic Slow-Mo & Speed Multipliers (`--speed`):** Adjust video speed (e.g. `--speed 0.5` or `--speed 0.75`) to turn fast or looping scenes into smooth, ambient background motion.
+- **📦 Standalone `.app` Bundle (`--build-app` / `--install-app`):**
+  - Package Macground into a native double-clickable `Macground.app` with an embedded app icon.
+  - Configured with `LSUIElement=true` to run cleanly as a menu bar agent with zero Dock clutter.
 - **🚀 Launch at Login (`--startup` / `--no-startup`):** Auto-starts your chosen desktop wallpaper upon user login using a lightweight native user LaunchAgent (`~/Library/LaunchAgents/com.macground.desktop.plist`), completely independent of terminal sessions.
 - **🔒 Native 4K @ 60 FPS Lock Screen Engine (`--mode lockscreen`):** Encodes your videos at native 4K UHD resolution (`3840x2160`) at a silky-smooth **60 FPS** with high-bitrate HEVC compression (~50 Mbps target). Features **Direct GPU Buffer Transfer** (zero CPU memcpy) matching Apple's native `4KSDR240FPS` Aerial format, hardlinking (`os.link`) the result across all Aerial slots so it uses 0 extra disk space and encodes in seconds.
-- **🎞️ Built-In Animated `.gif` Engine:** Renders `.gif` files natively via `AppKit` on the Desktop with zero conversion delay, and automatically converts `.gif` files into hardware-accelerated QuickTime `.mov` loops for the Lock Screen using native macOS `ImageIO` + `AVFoundation`.
 - **🪶 Zero `pip` Dependencies:** Uses only the Python standard library and macOS's built-in Xcode Command Line Tools (`xcrun swiftc`).
 - **♻️ One-Command Backup & Restore:** Automatically backs up original Apple `.mov` assets and your `Index.plist` before making changes, so you can revert to stock macOS settings at any time with `--restore-lockscreen`.
 
@@ -59,55 +70,58 @@ Or with an animated `.gif`:
 sudo python3 Macground.py /path/to/your/animation.gif
 ```
 
-> **💡 Lock Screen Tip:** Because macOS hardcodes **Golden Gate Sunset** to the read-only system bridge video, open **System Settings > Wallpaper** once, make sure **Show as screen saver** is enabled, and click **Tahoe Day** (right next to Golden Gate Sunset under *Landscape*), **Sequoia**, or **Yosemite**. Macground pre-populates all of those slots with your custom video so it plays immediately when you lock your screen (`Ctrl + Cmd + Q`).
+### 3. Rotate a Folder of Wallpapers on Desktop
+
+```bash
+python3 Macground.py ~/Wallpapers/ --mode desktop --interval 15m --shuffle --pause-on-battery
+```
+
+### 4. Build Standalone macOS App Bundle
+
+```bash
+python3 Macground.py --build-app
+# Or install directly into /Applications
+python3 Macground.py --install-app
+```
 
 ---
 
-## 🛠️ Usage & CLI Options
+## 🛠️ CLI Options & Reference
 
 ```text
 usage: Macground.py [-h] [--mode {both,desktop,lockscreen}]
-                    [--target-id TARGET_ID] [--fit]
-                    [--foreground] [--stop]
-                    [--list-lockscreen-slots] [--restore-lockscreen]
+                    [--target-id TARGET_ID] [--fit] [--foreground]
+                    [--speed SPEED] [--pause-on-battery]
+                    [--no-pause-on-low-power] [--interval INTERVAL]
+                    [--shuffle] [--ping-pong] [--crossfade CROSSFADE]
+                    [--build-app] [--install-app] [--startup] [--no-startup]
+                    [--stop] [--list-lockscreen-slots] [--restore-lockscreen]
                     [video]
 ```
 
-| Command / Flag | Description | Requires `sudo`? |
-| :--- | :--- | :---: |
-| `python3 Macground.py file.mp4 --mode desktop` | Play video or `.gif` on the Desktop background only (behind desktop icons, across all Spaces and monitors). | No |
-| `sudo python3 Macground.py file.mp4` | Apply to **both** the Desktop background and the macOS Lock Screen (`--mode both` is default). | Yes |
-| `sudo python3 Macground.py file.mp4 --mode lockscreen` | Install video or `.gif` into the native macOS Lock Screen Aerial engine only. | Yes |
-| `--speed 0.5` | Set custom playback speed multiplier (e.g. 0.5 for half-speed slow-mo, 0.75 for cinematic). | No |
-| `--startup` | Auto-start the desktop wallpaper on login via `~/Library/LaunchAgents/com.macground.desktop.plist`. | No |
-| `--no-startup` | Disable auto-start on login and remove the LaunchAgent. | No |
-| `--fit` | Letterbox/fit the video or GIF inside screen bounds instead of aspect-filling the screen. | No |
-| `--foreground` | Keep the Desktop player attached to your terminal window (`Ctrl+C` to stop) instead of daemonizing in the background. | No |
-| `python3 Macground.py --stop` | Stop the running background Desktop video/GIF wallpaper process. | No |
-| `python3 Macground.py --list-lockscreen-slots` | List all installed/downloaded macOS Aerial `.mov` slots on your Mac. | No |
-| `sudo python3 Macground.py --restore-lockscreen` | Restore original Apple Aerial videos and your original `Index.plist` Lock Screen configuration from backup. | Yes |
-
----
-
-## 🧠 How It Works Under the Hood
-
-macOS separates the user Desktop session from the Lock Screen (`loginwindow` / `WallpaperAerialsExtension` / `idleassetsd`):
-
-1. **Desktop Engine (`AVQueuePlayer` + `AVPlayerLooper` / `NSImageView`):**
-   On first run, Macground compiles a tiny native Swift binary into `.wallpaper_cache/desktop_video_player`. It creates a borderless `NSWindow` for every connected display at window level `kCGDesktopWindowLevel` with `.canJoinAllSpaces`, `.stationary`, and `ignoresMouseEvents = true`, plus `NSWorkspace.screensDidWakeNotification` and `com.apple.screenIsUnlocked` observers so playback never stalls after sleep or unlock.
-2. **Sequential Compressed Sample Loop & `FastStart` Builder (`AVAssetReader` + `AVAssetWriter` + `AVAssetExportSession`):**
-   Apple's native Lock Screen `.mov` files are 4-minute (`240s`), single-track (`tracks=1`), single-segment (`segments=1`), `moov`-first (`ftyp` -> `moov` -> `mdat`) QuickTime movies whose `stco` chunk byte offsets increase strictly monotonically from start to finish. If a file loops via multi-segment `elst` edit lists or non-monotonic `stco` chunk pointers, macOS's sandboxed Lock Screen hardware decoder fails on the 2nd lock with a black or static screen. Macground reads the compressed video samples once, strips audio, shifts B-frame timestamps to `0.0s`, writes 240 seconds of sequential compressed samples, and runs `AVAssetExportSession` with `shouldOptimizeForNetworkUse = true` so the resulting `.mov` matches Apple's native Aerial structure byte-for-byte.
-3. **Hardlinked Aerial Injection & Hardcode Bypass:**
-   On modern macOS, `WallpaperAerialsExtension` checks if the selected wallpaper ID is `4207734D-74FE-4F92-B5E1-6EC8DEE24A15` (*Golden Gate Sunset*) and forces `/System/Library/Wallpapers/.default/Golden Gate.mov` if so. Macground automatically switches your active `~/Library/Application Support/com.apple.wallpaper/Store/Index.plist` choice to non-hardcoded Landscape Aerial slots (`4C108785-A7BA-422E-9C79-B0129F1D5550` *Tahoe Day*, *Sequoia*, *Yosemite*, etc.), hardlinks (`os.link`) the prepared `.mov` across all Aerial directories so no extra disk space is used, clears `com.apple.quarantine` attributes and `ZPOINTSOFINTEREST` seek checkpoints in `Aerial.sqlite`, and restarts the wallpaper daemons.
-
----
-
-## 🔍 Search Keywords & Topics
-
-`macos-wallpaper` · `live-wallpaper-macos` · `video-wallpaper-mac` · `lockscreen-video-mac` · `gif-wallpaper-mac` · `macos-lock-screen` · `idleassetsd` · `aerial-wallpaper` · `macos-sonoma-wallpaper` · `macos-sequoia-wallpaper` · `macos-tahoe-wallpaper` · `avfoundation` · `python-macos`
+| Flag | Description | Default | Requires `sudo`? |
+| :--- | :--- | :---: | :---: |
+| `video` | Path to a video file (`.mp4`, `.mov`, `.m4v`), GIF (`.gif`), or directory of wallpapers. | — | Mode dependent |
+| `--mode {both,desktop,lockscreen}` | Wallpaper target. `desktop` requires no sudo. | `both` | Yes for lockscreen/both |
+| `--pause-on-battery` | Auto-pause video playback when running on MacBook battery power. | `False` | No |
+| `--no-pause-on-low-power` | Disable automatic pausing when macOS Low Power Mode is active. | Pauses on low power | No |
+| `--interval <time>` | Auto-rotation interval for folders/playlists (e.g. `5m`, `15m`, `30m`, `1h`, `300s`). | `15m` for folders | No |
+| `--shuffle` | Randomize the order of wallpapers in a folder or playlist. | `False` | No |
+| `--ping-pong` | Seamless bounce loop (plays forward, then reverses back to start). | `False` | No |
+| `--crossfade <frames>` | Crossfade frames at loop boundary to eliminate jump cuts. | `0` | No |
+| `--build-app` | Package Macground into a standalone double-clickable `Macground.app`. | — | No |
+| `--install-app` | Package and install `Macground.app` into `/Applications`. | — | No |
+| `--speed <float>` | Playback speed multiplier (e.g. `0.5` for cinematic slow-mo). | `1.0` | No |
+| `--startup` | Auto-start the desktop wallpaper on login via `~/Library/LaunchAgents`. | `False` | No |
+| `--no-startup` | Remove auto-start LaunchAgent. | — | No |
+| `--fit` | Fit media inside screen bounds instead of aspect filling. | `False` | No |
+| `--foreground` | Keep player attached to terminal instead of background daemon. | `False` | No |
+| `--stop` | Stop the running background desktop wallpaper process. | — | No |
+| `--list-lockscreen-slots` | List installed macOS Aerial `.mov` slots. | — | No |
+| `--restore-lockscreen` | Restore stock Apple Aerial videos and original `Index.plist`. | — | Yes |
 
 ---
 
 ## 📄 License
 
-Distributed under the **MIT License**. Feel free to fork, customize, and share!
+Distributed under the **MIT License**.
