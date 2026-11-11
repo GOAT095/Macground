@@ -1475,7 +1475,8 @@ def build_macos_app_bundle(output_dir: Path | None = None) -> Path:
     launcher_script = f"""#!/bin/sh
 DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
-exec /usr/bin/python3 "$DIR/Macground.py" "$@" --open-picker-if-empty
+cd "$DIR"
+exec /usr/bin/python3 "$DIR/Macground.py" --mode desktop "$@"
 """
     launcher_path.write_text(launcher_script, encoding="utf-8")
     os.chmod(launcher_path, 0o755)
@@ -2284,6 +2285,13 @@ def main():
         action="store_true",
         help="Restore original Apple Lock Screen Aerial videos and settings from backup (uses sudo).",
     )
+    parser.add_argument(
+        "--open-picker",
+        "--open-picker-if-empty",
+        dest="open_picker",
+        action="store_true",
+        help="Open native file picker to choose wallpaper or folder.",
+    )
 
     args = parser.parse_args()
 
@@ -2324,14 +2332,54 @@ def main():
         except Exception:
             print(f"[!] Warning: Invalid interval '{args.interval}', using manual rotation.")
 
-    if not args.video:
-        parser.print_help()
-        sys.exit(1)
+    target_path = None
+    if args.video:
+        target_path = Path(args.video).expanduser().resolve()
+        if not target_path.exists():
+            print(f"[!] Error: Path not found: {target_path}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # Check recents first
+        recents_file = Path.home() / ".macground_recents.json"
+        if recents_file.exists():
+            try:
+                recents = json.loads(recents_file.read_text(encoding="utf-8"))
+                for r in recents:
+                    p = Path(r)
+                    if p.exists():
+                        target_path = p
+                        break
+            except Exception:
+                pass
 
-    target_path = Path(args.video).expanduser().resolve()
-    if not target_path.exists():
-        print(f"[!] Error: Path not found: {target_path}", file=sys.stderr)
-        sys.exit(1)
+        # If no recents, check current and script folder for any media
+        if not target_path:
+            for sdir in [Path.cwd(), Path(__file__).resolve().parent, Path("/Users/mac/Desktop/test")]:
+                if sdir.exists():
+                    found_media = scan_media_paths(sdir)
+                    if found_media:
+                        target_path = found_media[0]
+                        break
+
+        # If still no media or open_picker requested, open native picker directly
+        if not target_path or args.open_picker:
+            binary_path = ensure_compiled_binary()
+            stop_existing_desktop_player()
+            cmd = [str(binary_path)]
+            if target_path:
+                cmd.append(str(target_path.resolve()))
+            cmd.append("--open-picker")
+            if args.fit:
+                cmd.append("--fit")
+            if args.speed != 1.0:
+                cmd.extend(["--speed", str(args.speed)])
+            if args.pause_on_battery:
+                cmd.append("--pause-on-battery")
+            if not args.no_pause_on_low_power:
+                cmd.append("--no-pause-on-low-power")
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            print("[+] Opened native wallpaper file picker.")
+            return
 
     items = scan_media_paths(target_path)
     if not items:

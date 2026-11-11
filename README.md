@@ -8,6 +8,7 @@
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](#)
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-Zero%20(Native%20AVFoundation)-2EA44F?style=for-the-badge)](#)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](#license)
+[![Architecture diagram](https://gitdiagram.com/diagram-badge.svg)](https://gitdiagram.com/goat095/macground?utm_source=readme&utm_medium=badge)
 
 </div>
 
